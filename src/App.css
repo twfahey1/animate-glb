@@ -337,6 +337,11 @@
   margin-top: 16px;
 }
 
+.detail-block-large {
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 .detail-list {
   margin: 10px 0 0;
   padding-left: 18px;
@@ -367,6 +372,22 @@
 .token-chip-target {
   border-color: rgba(255, 178, 97, 0.32);
   background: rgba(255, 178, 97, 0.08);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--soft-text);
+}
+
+.toggle-row input {
+  margin-top: 3px;
+}
+
+.option-note {
+  margin-top: 10px;
 }
 
 .prompt-form {

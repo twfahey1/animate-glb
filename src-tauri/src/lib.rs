@@ -62,6 +62,8 @@ struct RigDiagnostics {
   resolved_rig_slot_count: usize,
   total_rig_slot_count: usize,
   detected_humanoid_score: f32,
+  detected_rig_family: String,
+  family_confidence: f32,
   rig_status: String,
   rigging_needed: bool,
   notes: Vec<String>,
@@ -71,6 +73,8 @@ struct RigDiagnostics {
 #[serde(rename_all = "camelCase")]
 struct RigProposal {
   source: String,
+  rig_family: String,
+  canonical_slots: Vec<String>,
   rigging_needed: bool,
   confidence: f32,
   readiness: String,
@@ -85,6 +89,42 @@ struct RigProposal {
 #[serde(rename_all = "camelCase")]
 struct GenerateRigProposalInput {
   summary: GlbSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RigUpgradeChainPlan {
+  name: String,
+  slots: Vec<String>,
+  existing_nodes: Vec<String>,
+  action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RigUpgradePlan {
+  source: String,
+  rig_family: String,
+  canonical_slots: Vec<String>,
+  readiness: String,
+  confidence: f32,
+  rationale: String,
+  target_rig_type: String,
+  apply_strategy: String,
+  requires_weight_painting: bool,
+  can_export_after_upgrade: bool,
+  preserved_joint_slots: Vec<String>,
+  new_joint_slots: Vec<String>,
+  chain_plans: Vec<RigUpgradeChainPlan>,
+  recommended_steps: Vec<String>,
+  warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateRigUpgradeInput {
+  summary: GlbSummary,
+  proposal: RigProposal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +297,246 @@ fn rig_slot_labels() -> [&'static str; 21] {
   ]
 }
 
+fn normalize_rig_family(value: &str) -> String {
+  match value.trim().to_ascii_lowercase().as_str() {
+    "humanoid" | "human" | "biped" => "humanoid".to_string(),
+    "quadruped" | "canine" | "feline" | "equine" => "quadruped".to_string(),
+    "arachnid" | "spider" | "insectoid" => "arachnid".to_string(),
+    "prop" | "object" | "mechanical" => "prop".to_string(),
+    "generic-creature" | "creature" | "beast" | "animal" => "generic-creature".to_string(),
+    _ => "humanoid".to_string(),
+  }
+}
+
+fn family_slot_specs(rig_family: &str) -> Vec<(&'static str, Vec<&'static str>)> {
+  match normalize_rig_family(rig_family).as_str() {
+    "quadruped" => vec![
+      ("root", vec!["root", "armature", "origin"]),
+      ("pelvis", vec!["pelvis", "hips", "hip", "hindquarters", "croup"]),
+      ("spineLower", vec!["spine", "spinelower", "back", "lumbar"]),
+      ("spineUpper", vec!["spineupper", "chest", "torso", "ribcage", "withers"]),
+      ("neck", vec!["neck", "throat"]),
+      ("head", vec!["head", "skull", "snout", "muzzle"]),
+      ("jaw", vec!["jaw", "mouth", "chin"]),
+      ("frontLeftShoulder", vec!["frontleftshoulder", "leftfrontshoulder", "lfshoulder", "leftscapula"]),
+      ("frontLeftUpperLeg", vec!["frontleftleg", "leftfrontleg", "leftforeleg", "leftupperforeleg", "lfforeleg"]),
+      ("frontLeftLowerLeg", vec!["frontleftlowerleg", "leftfrontlowerleg", "leftforearm", "leftlowerforeleg", "lfforearm"]),
+      ("frontLeftFoot", vec!["frontleftfoot", "leftfrontfoot", "leftforepaw", "leftpaw", "lfpaw"]),
+      ("frontRightShoulder", vec!["frontrightshoulder", "rightfrontshoulder", "rfshoulder", "rightscapula"]),
+      ("frontRightUpperLeg", vec!["frontrightleg", "rightfrontleg", "rightforeleg", "rightupperforeleg", "rfforeleg"]),
+      ("frontRightLowerLeg", vec!["frontrightlowerleg", "rightfrontlowerleg", "rightforearm", "rightlowerforeleg", "rfforearm"]),
+      ("frontRightFoot", vec!["frontrightfoot", "rightfrontfoot", "rightforepaw", "rightpaw", "rfpaw"]),
+      ("hindLeftHip", vec!["hindlefthip", "lefthip", "leftrearhip", "lefthaunch"]),
+      ("hindLeftUpperLeg", vec!["hindleftleg", "lefthindleg", "leftrearleg", "leftthigh", "lrthigh"]),
+      ("hindLeftLowerLeg", vec!["hindleftlowerleg", "lefthindlowerleg", "leftrearcalf", "leftcalf", "lrcalf"]),
+      ("hindLeftFoot", vec!["hindleftfoot", "lefthindfoot", "leftrearfoot", "lefthindpaw", "lrpaw"]),
+      ("hindRightHip", vec!["hindrighthip", "righthip", "rightrearhip", "righthaunch"]),
+      ("hindRightUpperLeg", vec!["hindrightleg", "righthindleg", "rightrearleg", "rightthigh", "rrthigh"]),
+      ("hindRightLowerLeg", vec!["hindrightlowerleg", "righthindlowerleg", "rightrearcalf", "rightcalf", "rrcalf"]),
+      ("hindRightFoot", vec!["hindrightfoot", "righthindfoot", "rightrearfoot", "righthindpaw", "rrpaw"]),
+      ("tailBase", vec!["tailbase", "tail", "tailroot"]),
+      ("tailTip", vec!["tailtip", "tailend"]),
+    ],
+    "arachnid" => vec![
+      ("root", vec!["root", "armature", "origin"]),
+      ("abdomen", vec!["abdomen", "rearbody", "opisthosoma"]),
+      ("thorax", vec!["thorax", "cephalothorax", "body", "midbody"]),
+      ("head", vec!["head", "face", "mandible"]),
+      ("frontLeftLegA", vec!["frontleftlega", "leftleg1", "leg1l", "l1"]),
+      ("frontLeftLegB", vec!["frontleftlegb", "leftleg2", "leg2l", "l2"]),
+      ("midLeftLegA", vec!["midleftlega", "leftleg3", "leg3l", "l3"]),
+      ("midLeftLegB", vec!["midleftlegb", "leftleg4", "leg4l", "l4"]),
+      ("frontRightLegA", vec!["frontrightlega", "rightleg1", "leg1r", "r1"]),
+      ("frontRightLegB", vec!["frontrightlegb", "rightleg2", "leg2r", "r2"]),
+      ("midRightLegA", vec!["midrightlega", "rightleg3", "leg3r", "r3"]),
+      ("midRightLegB", vec!["midrightlegb", "rightleg4", "leg4r", "r4"]),
+      ("rearLeftLegA", vec!["rearleftlega", "leftleg5", "leg5l", "l5"]),
+      ("rearLeftLegB", vec!["rearleftlegb", "leftleg6", "leg6l", "l6"]),
+      ("backLeftLegA", vec!["backleftlega", "leftleg7", "leg7l", "l7"]),
+      ("backLeftLegB", vec!["backleftlegb", "leftleg8", "leg8l", "l8"]),
+      ("rearRightLegA", vec!["rearrightlega", "rightleg5", "leg5r", "r5"]),
+      ("rearRightLegB", vec!["rearrightlegb", "rightleg6", "leg6r", "r6"]),
+      ("backRightLegA", vec!["backrightlega", "rightleg7", "leg7r", "r7"]),
+      ("backRightLegB", vec!["backrightlegb", "rightleg8", "leg8r", "r8"]),
+    ],
+    "prop" => vec![
+      ("root", vec!["root", "origin", "armature"]),
+      ("body", vec!["body", "base", "core", "frame"]),
+      ("pivot", vec!["pivot", "hinge", "joint", "mount", "wheel"]),
+      ("tip", vec!["tip", "end", "lid", "door", "head"]),
+    ],
+    "generic-creature" => vec![
+      ("root", vec!["root", "armature", "origin"]),
+      ("body", vec!["body", "torso", "core", "spine"]),
+      ("neck", vec!["neck", "throat"]),
+      ("head", vec!["head", "skull", "snout", "face"]),
+      ("frontLeftLimb", vec!["frontleftlimb", "leftfrontlimb", "leftarm", "leftforeleg"]),
+      ("frontRightLimb", vec!["frontrightlimb", "rightfrontlimb", "rightarm", "rightforeleg"]),
+      ("rearLeftLimb", vec!["rearleftlimb", "leftrearlimb", "leftleg", "lefthindleg"]),
+      ("rearRightLimb", vec!["rearrightlimb", "rightrearlimb", "rightleg", "righthindleg"]),
+      ("tailBase", vec!["tailbase", "tail", "tailroot"]),
+      ("tailTip", vec!["tailtip", "tailend"]),
+    ],
+    _ => vec![
+      ("root", vec!["root", "armature", "origin"]),
+      ("pelvis", vec!["hips", "pelvis", "hip"]),
+      ("spine", vec!["spine", "spine1", "spine01"]),
+      ("chest", vec!["chest", "spine2", "spine02", "upperchest"]),
+      ("neck", vec!["neck", "neck1"]),
+      ("head", vec!["head", "headtop"]),
+      ("jaw", vec!["jaw", "chin", "mouth"]),
+      ("leftShoulder", vec!["leftshoulder", "shoulderl", "lshoulder", "claviclel"]),
+      ("leftUpperArm", vec!["leftarm", "leftupperarm", "upperarml", "arml", "larm"]),
+      ("leftForearm", vec!["leftforearm", "leftlowerarm", "forearml", "lowerarml", "lforearm"]),
+      ("leftHand", vec!["lefthand", "handl", "lhand"]),
+      ("rightShoulder", vec!["rightshoulder", "shoulderr", "rshoulder", "clavicler"]),
+      ("rightUpperArm", vec!["rightarm", "rightupperarm", "upperarmr", "armr", "rarm"]),
+      ("rightForearm", vec!["rightforearm", "rightlowerarm", "forearmr", "lowerarmr", "rforearm"]),
+      ("rightHand", vec!["righthand", "handr", "rhand"]),
+      ("leftThigh", vec!["leftupleg", "leftthigh", "uplegl", "thighl", "lthigh"]),
+      ("leftCalf", vec!["leftleg", "leftcalf", "legl", "calfl", "lcalf"]),
+      ("leftFoot", vec!["leftfoot", "footl", "lfoot"]),
+      ("rightThigh", vec!["rightupleg", "rightthigh", "uplegr", "thighr", "rthigh"]),
+      ("rightCalf", vec!["rightleg", "rightcalf", "legr", "calfr", "rcalf"]),
+      ("rightFoot", vec!["rightfoot", "footr", "rfoot"]),
+    ],
+  }
+}
+
+fn canonical_slots_for_family(rig_family: &str) -> Vec<String> {
+  family_slot_specs(rig_family)
+    .into_iter()
+    .map(|(slot_name, _)| slot_name.to_string())
+    .collect()
+}
+
+fn family_chain_specs(rig_family: &str) -> Vec<(&'static str, Vec<&'static str>)> {
+  match normalize_rig_family(rig_family).as_str() {
+    "quadruped" => vec![
+      ("Spine chain", vec!["root", "pelvis", "spineLower", "spineUpper", "neck", "head"]),
+      ("Front left leg", vec!["frontLeftShoulder", "frontLeftUpperLeg", "frontLeftLowerLeg", "frontLeftFoot"]),
+      ("Front right leg", vec!["frontRightShoulder", "frontRightUpperLeg", "frontRightLowerLeg", "frontRightFoot"]),
+      ("Hind left leg", vec!["hindLeftHip", "hindLeftUpperLeg", "hindLeftLowerLeg", "hindLeftFoot"]),
+      ("Hind right leg", vec!["hindRightHip", "hindRightUpperLeg", "hindRightLowerLeg", "hindRightFoot"]),
+      ("Tail chain", vec!["tailBase", "tailTip"]),
+    ],
+    "arachnid" => vec![
+      ("Body chain", vec!["root", "abdomen", "thorax", "head"]),
+      ("Front left legs", vec!["frontLeftLegA", "frontLeftLegB"]),
+      ("Front right legs", vec!["frontRightLegA", "frontRightLegB"]),
+      ("Mid left legs", vec!["midLeftLegA", "midLeftLegB"]),
+      ("Mid right legs", vec!["midRightLegA", "midRightLegB"]),
+      ("Rear left legs", vec!["rearLeftLegA", "rearLeftLegB", "backLeftLegA", "backLeftLegB"]),
+      ("Rear right legs", vec!["rearRightLegA", "rearRightLegB", "backRightLegA", "backRightLegB"]),
+    ],
+    "prop" => vec![("Control chain", vec!["root", "body", "pivot", "tip"])],
+    "generic-creature" => vec![
+      ("Body chain", vec!["root", "body", "neck", "head"]),
+      ("Front limbs", vec!["frontLeftLimb", "frontRightLimb"]),
+      ("Rear limbs", vec!["rearLeftLimb", "rearRightLimb"]),
+      ("Tail chain", vec!["tailBase", "tailTip"]),
+    ],
+    _ => vec![
+      ("Spine chain", vec!["root", "pelvis", "spine", "chest", "neck", "head"]),
+      ("Left arm chain", vec!["leftShoulder", "leftUpperArm", "leftForearm", "leftHand"]),
+      ("Right arm chain", vec!["rightShoulder", "rightUpperArm", "rightForearm", "rightHand"]),
+      ("Left leg chain", vec!["leftThigh", "leftCalf", "leftFoot"]),
+      ("Right leg chain", vec!["rightThigh", "rightCalf", "rightFoot"]),
+    ],
+  }
+}
+
+fn family_detection_keyword_map() -> Vec<(&'static str, Vec<&'static str>)> {
+  vec![
+    (
+      "humanoid",
+      vec!["head", "neck", "shoulder", "arm", "forearm", "hand", "finger", "pelvis", "spine", "thigh", "calf", "foot"],
+    ),
+    (
+      "quadruped",
+      vec!["wolf", "dog", "canine", "cat", "feline", "horse", "quadruped", "paw", "snout", "muzzle", "tail", "foreleg", "hindleg", "haunch", "withers"],
+    ),
+    (
+      "arachnid",
+      vec!["spider", "arach", "abdomen", "thorax", "cephalothorax", "mandible", "pedipalp", "spinneret", "leg1", "leg2", "leg3", "leg4"],
+    ),
+    (
+      "prop",
+      vec!["prop", "object", "door", "lid", "hinge", "wheel", "axle", "turret", "handle", "mount", "panel"],
+    ),
+  ]
+}
+
+fn detect_rig_family(
+  file_name: &str,
+  node_names: &[String],
+  target_node_names: &[String],
+  mesh_count: usize,
+  joint_count: usize,
+) -> (String, f32) {
+  let mut corpus = vec![file_name.to_string()];
+  corpus.extend(node_names.iter().cloned());
+  corpus.extend(target_node_names.iter().cloned());
+
+  let normalized_corpus = corpus
+    .iter()
+    .map(|value| normalize_lookup_key(value))
+    .collect::<Vec<_>>();
+  let mut scored_families = family_detection_keyword_map()
+    .into_iter()
+    .map(|(family, keywords)| {
+      let score = keywords
+        .into_iter()
+        .map(|keyword| {
+          let normalized_keyword = normalize_lookup_key(keyword);
+          normalized_corpus
+            .iter()
+            .filter(|candidate| candidate.contains(&normalized_keyword))
+            .count() as f32
+        })
+        .sum::<f32>();
+      (family.to_string(), score)
+    })
+    .collect::<Vec<_>>();
+
+  let leg_index_hits = normalized_corpus
+    .iter()
+    .filter(|candidate| (1..=8).any(|index| candidate.contains(&format!("leg{index}"))))
+    .count() as f32;
+  if let Some((_, score)) = scored_families.iter_mut().find(|(family, _)| family == "arachnid") {
+    *score += leg_index_hits * 0.8;
+  }
+
+  if let Some((_, score)) = scored_families.iter_mut().find(|(family, _)| family == "quadruped") {
+    if normalized_corpus.iter().any(|candidate| candidate.contains("paw") || candidate.contains("tail")) {
+      *score += 1.5;
+    }
+  }
+
+  if let Some((_, score)) = scored_families.iter_mut().find(|(family, _)| family == "humanoid") {
+    if joint_count >= 12 {
+      *score += 2.0;
+    }
+  }
+
+  scored_families.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
+  let (best_family, best_score) = scored_families
+    .first()
+    .cloned()
+    .unwrap_or_else(|| ("humanoid".to_string(), 0.0));
+
+  if best_score < 1.2 {
+    if mesh_count > 0 && joint_count == 0 && target_node_names.len() < 4 {
+      return ("prop".to_string(), 0.42);
+    }
+
+    return ("generic-creature".to_string(), 0.35);
+  }
+
+  let confidence = (best_score / 7.5).clamp(0.35, 0.98);
+  (best_family, confidence)
+}
+
 fn resolved_rig_slot_count(rig_profile: &RigProfile) -> usize {
   [
     rig_profile.root.as_ref(),
@@ -286,36 +566,71 @@ fn resolved_rig_slot_count(rig_profile: &RigProfile) -> usize {
   .count()
 }
 
-fn unresolved_rig_slots(rig_profile: &RigProfile) -> Vec<String> {
-  let slots = [
-    ("root", rig_profile.root.as_ref()),
-    ("pelvis", rig_profile.pelvis.as_ref()),
-    ("spine", rig_profile.spine.as_ref()),
-    ("chest", rig_profile.chest.as_ref()),
-    ("neck", rig_profile.neck.as_ref()),
-    ("head", rig_profile.head.as_ref()),
-    ("jaw", rig_profile.jaw.as_ref()),
-    ("leftShoulder", rig_profile.left_shoulder.as_ref()),
-    ("leftUpperArm", rig_profile.left_upper_arm.as_ref()),
-    ("leftForearm", rig_profile.left_forearm.as_ref()),
-    ("leftHand", rig_profile.left_hand.as_ref()),
-    ("rightShoulder", rig_profile.right_shoulder.as_ref()),
-    ("rightUpperArm", rig_profile.right_upper_arm.as_ref()),
-    ("rightForearm", rig_profile.right_forearm.as_ref()),
-    ("rightHand", rig_profile.right_hand.as_ref()),
-    ("leftThigh", rig_profile.left_thigh.as_ref()),
-    ("leftCalf", rig_profile.left_calf.as_ref()),
-    ("leftFoot", rig_profile.left_foot.as_ref()),
-    ("rightThigh", rig_profile.right_thigh.as_ref()),
-    ("rightCalf", rig_profile.right_calf.as_ref()),
-    ("rightFoot", rig_profile.right_foot.as_ref()),
-  ];
+fn family_slot_value(summary: &GlbSummary, rig_family: &str, slot_name: &str) -> Option<String> {
+  if normalize_rig_family(rig_family) == "humanoid" {
+    return rig_slot_value(&summary.rig_profile, slot_name);
+  }
 
-  slots
+  let mut candidates = summary.node_names.clone();
+  candidates.extend(summary.target_node_names.iter().cloned());
+
+  family_slot_specs(rig_family)
     .into_iter()
-    .filter(|(_, value)| value.is_none())
-    .map(|(label, _)| label.to_string())
+    .find(|(candidate_slot_name, _)| *candidate_slot_name == slot_name)
+    .and_then(|(_, keywords)| find_profile_node(&candidates, &keywords))
+}
+
+fn resolved_family_slots(summary: &GlbSummary, rig_family: &str) -> Vec<String> {
+  canonical_slots_for_family(rig_family)
+    .into_iter()
+    .filter(|slot_name| family_slot_value(summary, rig_family, slot_name).is_some())
     .collect()
+}
+
+fn unresolved_family_slots(summary: &GlbSummary, rig_family: &str) -> Vec<String> {
+  canonical_slots_for_family(rig_family)
+    .into_iter()
+    .filter(|slot_name| family_slot_value(summary, rig_family, slot_name).is_none())
+    .collect()
+}
+
+fn rig_slot_value(rig_profile: &RigProfile, slot_name: &str) -> Option<String> {
+  match slot_name {
+    "root" => rig_profile.root.clone(),
+    "pelvis" => rig_profile.pelvis.clone(),
+    "spine" => rig_profile.spine.clone(),
+    "chest" => rig_profile.chest.clone(),
+    "neck" => rig_profile.neck.clone(),
+    "head" => rig_profile.head.clone(),
+    "jaw" => rig_profile.jaw.clone(),
+    "leftShoulder" => rig_profile.left_shoulder.clone(),
+    "leftUpperArm" => rig_profile.left_upper_arm.clone(),
+    "leftForearm" => rig_profile.left_forearm.clone(),
+    "leftHand" => rig_profile.left_hand.clone(),
+    "rightShoulder" => rig_profile.right_shoulder.clone(),
+    "rightUpperArm" => rig_profile.right_upper_arm.clone(),
+    "rightForearm" => rig_profile.right_forearm.clone(),
+    "rightHand" => rig_profile.right_hand.clone(),
+    "leftThigh" => rig_profile.left_thigh.clone(),
+    "leftCalf" => rig_profile.left_calf.clone(),
+    "leftFoot" => rig_profile.left_foot.clone(),
+    "rightThigh" => rig_profile.right_thigh.clone(),
+    "rightCalf" => rig_profile.right_calf.clone(),
+    "rightFoot" => rig_profile.right_foot.clone(),
+    _ => None,
+  }
+}
+
+fn build_family_chain_plan(name: &str, slots: &[&str], summary: &GlbSummary, rig_family: &str, action: &str) -> RigUpgradeChainPlan {
+  RigUpgradeChainPlan {
+    name: name.to_string(),
+    slots: slots.iter().map(|slot| slot.to_string()).collect(),
+    existing_nodes: slots
+      .iter()
+      .filter_map(|slot| family_slot_value(summary, rig_family, slot))
+      .collect(),
+    action: action.to_string(),
+  }
 }
 
 fn find_profile_node(candidates: &[String], keywords: &[&str]) -> Option<String> {
@@ -375,7 +690,13 @@ fn build_rig_profile(node_names: &[String]) -> RigProfile {
   }
 }
 
-fn build_rig_diagnostics(document: &gltf::Gltf, rig_profile: &RigProfile, target_node_names: &[String]) -> RigDiagnostics {
+fn build_rig_diagnostics(
+  document: &gltf::Gltf,
+  file_name: &str,
+  node_names: &[String],
+  rig_profile: &RigProfile,
+  target_node_names: &[String],
+) -> RigDiagnostics {
   let mesh_count = document.meshes().count();
   let primitive_count = document.meshes().map(|mesh| mesh.primitives().count()).sum();
   let material_count = document.materials().count();
@@ -388,6 +709,8 @@ fn build_rig_diagnostics(document: &gltf::Gltf, rig_profile: &RigProfile, target
     + ((joint_count.min(24) as f32 / 24.0) * 0.25)
     + ((target_node_names.len().min(24) as f32 / 24.0) * 0.10))
     .clamp(0.0, 1.0);
+  let (detected_rig_family, family_confidence) =
+    detect_rig_family(file_name, node_names, target_node_names, mesh_count, joint_count);
 
   let rig_status = if skin_count > 0 && joint_count >= 12 && resolved_rig_slot_count >= 8 {
     "rigged"
@@ -423,6 +746,13 @@ fn build_rig_diagnostics(document: &gltf::Gltf, rig_profile: &RigProfile, target
     notes.push("No obvious hand targets were detected, which limits expressive prompt-driven arm motion.".to_string());
   }
 
+  if detected_rig_family != "humanoid" {
+    notes.push(format!(
+      "Detected this asset as a {} candidate. Family-aware proposal and upgrade planning should preserve that form instead of forcing a humanoid skeleton.",
+      detected_rig_family.replace('-', " ")
+    ));
+  }
+
   RigDiagnostics {
     mesh_count,
     primitive_count,
@@ -434,6 +764,8 @@ fn build_rig_diagnostics(document: &gltf::Gltf, rig_profile: &RigProfile, target
     resolved_rig_slot_count,
     total_rig_slot_count,
     detected_humanoid_score,
+    detected_rig_family,
+    family_confidence,
     rig_status,
     rigging_needed,
     notes,
@@ -441,9 +773,14 @@ fn build_rig_diagnostics(document: &gltf::Gltf, rig_profile: &RigProfile, target
 }
 
 fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
-  let unresolved_slots = unresolved_rig_slots(&summary.rig_profile);
+  let rig_family = normalize_rig_family(&summary.rig_diagnostics.detected_rig_family);
+  let canonical_slots = canonical_slots_for_family(&rig_family);
+  let unresolved_slots = unresolved_family_slots(summary, &rig_family);
   let diagnostics = &summary.rig_diagnostics;
-  let confidence = diagnostics.detected_humanoid_score.clamp(0.0, 1.0);
+  let confidence = diagnostics
+    .family_confidence
+    .max(diagnostics.detected_humanoid_score)
+    .clamp(0.0, 1.0);
   let mut recommended_actions = Vec::new();
   let mut warnings = Vec::new();
   let readiness;
@@ -451,19 +788,37 @@ fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
 
   if diagnostics.rig_status == "rigged" {
     readiness = "ready".to_string();
-    rationale = "The asset already looks rigged enough to support canonical targeting. Focus on refining joint naming and retargeting quality instead of generating a fresh skeleton.".to_string();
-    recommended_actions.push("Use the inferred canonical joint profile as the targeting map for prompt generation.".to_string());
+    rationale = format!(
+      "The asset already looks rigged enough to support {} targeting. Focus on refining joint naming and retargeting quality instead of generating a fresh skeleton.",
+      rig_family.replace('-', " ")
+    );
+    recommended_actions.push(format!(
+      "Use the inferred {} joint family as the targeting map for prompt generation.",
+      rig_family.replace('-', " ")
+    ));
     recommended_actions.push("Review ambiguous or missing slots before exporting production animations.".to_string());
   } else if diagnostics.rig_status == "partial" {
     readiness = "needs-remap".to_string();
-    rationale = "The asset has some rig structure, but it is incomplete or inconsistent. A rig proposal should preserve existing joints where possible and fill the missing canonical slots.".to_string();
-    recommended_actions.push("Preserve existing skins and joints, then remap them onto the canonical humanoid profile.".to_string());
+    rationale = format!(
+      "The asset has some rig structure, but it is incomplete or inconsistent. A rig proposal should preserve existing joints where possible and fill the missing canonical {} slots.",
+      rig_family.replace('-', " ")
+    );
+    recommended_actions.push(format!(
+      "Preserve existing skins and joints, then remap them onto the canonical {} profile.",
+      rig_family.replace('-', " ")
+    ));
     recommended_actions.push("Generate proposals for unresolved slots before attempting motion export.".to_string());
     warnings.push("Partial rigs are prone to side-label mistakes and missing limb chains.".to_string());
   } else {
     readiness = "needs-rigging".to_string();
-    rationale = "The asset does not appear to have a complete animation-ready rig. Generate a canonical humanoid skeleton proposal and require review before applying any binding changes.".to_string();
-    recommended_actions.push("Infer a humanoid skeleton layout from mesh bounds, hierarchy, and naming hints.".to_string());
+    rationale = format!(
+      "The asset does not appear to have a complete animation-ready rig. Generate a canonical {} skeleton proposal and require review before applying any binding changes.",
+      rig_family.replace('-', " ")
+    );
+    recommended_actions.push(format!(
+      "Infer a {} skeleton layout from mesh bounds, hierarchy, and naming hints.",
+      rig_family.replace('-', " ")
+    ));
     recommended_actions.push("Create a non-destructive rig proposal before any skin binding is written back to disk.".to_string());
     warnings.push("This asset may need manual cleanup after any automated rigging pass.".to_string());
   }
@@ -474,6 +829,8 @@ fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
 
   RigProposal {
     source: "fallback".to_string(),
+    rig_family,
+    canonical_slots,
     rigging_needed: diagnostics.rigging_needed,
     confidence,
     readiness,
@@ -486,6 +843,11 @@ fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
 }
 
 fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> RigProposal {
+  proposal.rig_family = normalize_rig_family(if proposal.rig_family.trim().is_empty() {
+    &summary.rig_diagnostics.detected_rig_family
+  } else {
+    &proposal.rig_family
+  });
   proposal.confidence = proposal.confidence.clamp(0.0, 1.0);
 
   if proposal.source.trim().is_empty() {
@@ -512,7 +874,11 @@ fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> Rig
     proposal.proposed_rig_profile = summary.rig_profile.clone();
   }
 
-  proposal.unresolved_slots = unresolved_rig_slots(&proposal.proposed_rig_profile);
+  if proposal.canonical_slots.is_empty() {
+    proposal.canonical_slots = canonical_slots_for_family(&proposal.rig_family);
+  }
+
+  proposal.unresolved_slots = unresolved_family_slots(summary, &proposal.rig_family);
 
   if proposal.warnings.is_empty() {
     proposal.warnings = fallback_rig_proposal(summary).warnings;
@@ -520,6 +886,143 @@ fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> Rig
 
   proposal.rigging_needed = proposal.rigging_needed || summary.rig_diagnostics.rigging_needed;
   proposal
+}
+
+fn fallback_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -> RigUpgradePlan {
+  let diagnostics = &summary.rig_diagnostics;
+  let rig_family = normalize_rig_family(&proposal.rig_family);
+  let canonical_slots = if proposal.canonical_slots.is_empty() {
+    canonical_slots_for_family(&rig_family)
+  } else {
+    proposal.canonical_slots.clone()
+  };
+  let preserved_joint_slots = resolved_family_slots(summary, &rig_family);
+  let new_joint_slots = unresolved_family_slots(summary, &rig_family);
+  let (readiness, apply_strategy, rationale, requires_weight_painting, can_export_after_upgrade) =
+    if diagnostics.rig_status == "rigged" && !proposal.rigging_needed {
+      (
+        "ready-for-retargeting".to_string(),
+        "preserve-and-remap".to_string(),
+        format!(
+          "The asset already contains enough rig structure to focus on {} joint remapping and canonical targeting instead of building a new skeleton from scratch.",
+          rig_family.replace('-', " ")
+        ),
+        false,
+        true,
+      )
+    } else if diagnostics.rig_status == "partial" {
+      (
+        "needs-hybrid-upgrade".to_string(),
+        "hybrid-remap-and-add".to_string(),
+        format!(
+          "The asset has partial rig data. Preserve usable joints, add missing canonical {} chains, then review skin assignment for the new joints before export.",
+          rig_family.replace('-', " ")
+        ),
+        true,
+        true,
+      )
+    } else {
+      (
+        "needs-full-rigging".to_string(),
+        "generate-canonical-skeleton".to_string(),
+        format!(
+          "The asset does not appear to be animation-ready. Create a canonical {} skeleton, bind the mesh non-destructively, then validate the result before downstream export.",
+          rig_family.replace('-', " ")
+        ),
+        true,
+        true,
+      )
+    };
+
+  let chain_action = match apply_strategy.as_str() {
+    "preserve-and-remap" => "preserve",
+    "hybrid-remap-and-add" => "hybrid",
+    _ => "create",
+  };
+
+  let mut recommended_steps = vec![
+    "Review the proposed canonical slots and confirm side labeling before applying any rig changes.".to_string(),
+    "Create a derived asset for rig upgrades instead of overwriting the source GLB.".to_string(),
+  ];
+
+  if requires_weight_painting {
+    recommended_steps.push("Generate or refine skin weights for any newly added joints before exporting a reusable rigged asset.".to_string());
+  } else {
+    recommended_steps.push("Retarget prompt-driven animation against the preserved canonical joints and validate exported clips.".to_string());
+  }
+
+  let mut warnings = proposal.warnings.clone();
+  if requires_weight_painting {
+    warnings.push("This upgrade path still needs a future mesh-binding phase before the asset can be considered fully auto-rigged.".to_string());
+  }
+
+  RigUpgradePlan {
+    source: "fallback".to_string(),
+    rig_family: rig_family.clone(),
+    canonical_slots,
+    readiness,
+    confidence: proposal.confidence.clamp(0.0, 1.0),
+    rationale,
+    target_rig_type: format!("canonical-{rig_family}"),
+    apply_strategy,
+    requires_weight_painting,
+    can_export_after_upgrade,
+    preserved_joint_slots,
+    new_joint_slots,
+    chain_plans: family_chain_specs(&rig_family)
+      .into_iter()
+      .map(|(name, slots)| build_family_chain_plan(name, &slots, summary, &rig_family, chain_action))
+      .collect(),
+    recommended_steps,
+    warnings,
+  }
+}
+
+fn sanitize_rig_upgrade_plan(mut plan: RigUpgradePlan, summary: &GlbSummary, proposal: &RigProposal) -> RigUpgradePlan {
+  plan.rig_family = normalize_rig_family(if plan.rig_family.trim().is_empty() {
+    &proposal.rig_family
+  } else {
+    &plan.rig_family
+  });
+  plan.confidence = plan.confidence.clamp(0.0, 1.0);
+
+  if plan.source.trim().is_empty() {
+    plan.source = "fallback".to_string();
+  }
+
+  if plan.target_rig_type.trim().is_empty() {
+    plan.target_rig_type = format!("canonical-{}", plan.rig_family);
+  }
+
+  if plan.apply_strategy.trim().is_empty() {
+    plan.apply_strategy = fallback_rig_upgrade_plan(summary, proposal).apply_strategy;
+  }
+
+  if plan.rationale.trim().is_empty() {
+    plan.rationale = "Generated a rig upgrade plan from the current proposal and diagnostics.".to_string();
+  }
+
+  if plan.chain_plans.is_empty() {
+    plan.chain_plans = fallback_rig_upgrade_plan(summary, proposal).chain_plans;
+  }
+
+  if plan.canonical_slots.is_empty() {
+    plan.canonical_slots = canonical_slots_for_family(&plan.rig_family);
+  }
+
+  if plan.preserved_joint_slots.is_empty() {
+    plan.preserved_joint_slots = resolved_family_slots(summary, &plan.rig_family);
+  }
+
+  if plan.new_joint_slots.is_empty() {
+    plan.new_joint_slots = unresolved_family_slots(summary, &plan.rig_family);
+  }
+
+  if plan.recommended_steps.is_empty() {
+    plan.recommended_steps = fallback_rig_upgrade_plan(summary, proposal).recommended_steps;
+  }
+
+  plan
 }
 
 fn find_matching_target_name(requested_name: &str, summary: &GlbSummary) -> Option<String> {
@@ -1016,12 +1519,12 @@ async fn openai_rig_proposal(summary: &GlbSummary) -> Result<Option<RigProposal>
     "messages": [
       {
         "role": "system",
-        "content": "You analyze 3D character assets for rigging readiness. Return JSON only. You never claim that rigging has been applied. Instead, return a cautious proposal with these keys: source, riggingNeeded, confidence, readiness, rationale, proposedRigProfile, unresolvedSlots, recommendedActions, warnings. proposedRigProfile must use the canonical keys root, pelvis, spine, chest, neck, head, jaw, leftShoulder, leftUpperArm, leftForearm, leftHand, rightShoulder, rightUpperArm, rightForearm, rightHand, leftThigh, leftCalf, leftFoot, rightThigh, rightCalf, rightFoot."
+        "content": "You analyze 3D assets for rigging readiness. Return JSON only. You never claim that rigging has been applied. Instead, return a cautious proposal with these keys: source, rigFamily, canonicalSlots, riggingNeeded, confidence, readiness, rationale, proposedRigProfile, unresolvedSlots, recommendedActions, warnings. Respect the detected rig family in the summary. Never convert quadruped, arachnid, generic-creature, or prop assets into humanoids unless the evidence is overwhelming. proposedRigProfile may remain sparse for non-humanoid families."
       },
       {
         "role": "user",
         "content": format!(
-          "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nReturn a cautious rigging proposal. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps.",
+          "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nReturn a cautious rigging proposal that preserves the detected family shape. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps. The canonicalSlots field should match the target family rather than defaulting to humanoid slots.",
           serde_json::to_string(summary).map_err(|error| error.to_string())?,
           serde_json::to_string(&summary.rig_diagnostics).map_err(|error| error.to_string())?
         )
@@ -1059,6 +1562,63 @@ async fn openai_rig_proposal(summary: &GlbSummary) -> Result<Option<RigProposal>
   Ok(Some(sanitize_rig_proposal(proposal, summary)))
 }
 
+async fn openai_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -> Result<Option<RigUpgradePlan>, String> {
+  let api_key = match env::var("OPENAI_API_KEY") {
+    Ok(value) if !value.trim().is_empty() => value,
+    _ => return Ok(None),
+  };
+
+  let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
+  let client = reqwest::Client::new();
+  let request_body = json!({
+    "model": model,
+    "response_format": { "type": "json_object" },
+    "messages": [
+      {
+        "role": "system",
+        "content": "You plan cautious rig upgrades for 3D assets. Return JSON only. Never claim that weights or rigging have already been applied. Return these keys: source, rigFamily, canonicalSlots, readiness, confidence, rationale, targetRigType, applyStrategy, requiresWeightPainting, canExportAfterUpgrade, preservedJointSlots, newJointSlots, chainPlans, recommendedSteps, warnings. Each chainPlans item must include name, slots, existingNodes, action. Respect the requested rig family and never humanoidize quadruped, arachnid, prop, or generic-creature assets."
+      },
+      {
+        "role": "user",
+        "content": format!(
+          "Model summary: {}\n\nRig proposal: {}\n\nBuild a non-destructive rig upgrade plan that preserves the asset's detected family. Prefer preserving existing rig structure when it exists. If the asset is unrigged, plan for canonical family-appropriate skeleton creation plus later weight generation. targetRigType should be family-specific, for example canonical-quadruped or canonical-arachnid when appropriate.",
+          serde_json::to_string(summary).map_err(|error| error.to_string())?,
+          serde_json::to_string(proposal).map_err(|error| error.to_string())?
+        )
+      }
+    ]
+  });
+
+  let response = client
+    .post("https://api.openai.com/v1/chat/completions")
+    .bearer_auth(api_key)
+    .json(&request_body)
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+  if !response.status().is_success() {
+    return Err(format!("OpenAI rig upgrade request failed with status {}", response.status()));
+  }
+
+  let payload = response
+    .json::<serde_json::Value>()
+    .await
+    .map_err(|error| error.to_string())?;
+  let content = payload
+    .get("choices")
+    .and_then(|choices| choices.get(0))
+    .and_then(|choice| choice.get("message"))
+    .and_then(|message| message.get("content"))
+    .and_then(|content| content.as_str())
+    .ok_or_else(|| "OpenAI response did not contain JSON content for a rig upgrade plan.".to_string())?;
+
+  let mut plan = serde_json::from_str::<RigUpgradePlan>(content)
+    .map_err(|error| format!("OpenAI returned invalid JSON for a rig upgrade plan: {error}"))?;
+  plan.source = "openai".to_string();
+  Ok(Some(sanitize_rig_upgrade_plan(plan, summary, proposal)))
+}
+
 #[tauri::command]
 async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
   let canonical_path = fs::canonicalize(PathBuf::from(file_path.clone()))
@@ -1073,6 +1633,11 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     return Err("Only .glb and .gltf files are supported right now.".to_string());
   }
 
+  let file_name = canonical_path
+    .file_name()
+    .and_then(|value| value.to_str())
+    .unwrap_or("Unnamed model")
+    .to_string();
   let metadata = fs::metadata(&canonical_path)
     .map_err(|error| format!("Unable to read file metadata: {error}"))?;
   let document = gltf::Gltf::open(&canonical_path)
@@ -1101,7 +1666,8 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
       let key = normalize_lookup_key(name);
       [
         "head", "neck", "jaw", "spine", "chest", "hip", "pelvis", "root", "shoulder", "arm",
-        "forearm", "hand", "finger", "leg", "foot", "toe"
+        "forearm", "hand", "finger", "leg", "foot", "toe", "tail", "paw", "snout", "muzzle",
+        "foreleg", "hindleg", "thorax", "abdomen", "mandible", "hinge", "wheel", "door", "lid"
       ]
       .iter()
       .any(|keyword| key.contains(keyword))
@@ -1109,7 +1675,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     .take(96)
     .collect::<Vec<_>>();
   let rig_profile = build_rig_profile(&node_names);
-  let rig_diagnostics = build_rig_diagnostics(&document, &rig_profile, &target_node_names);
+  let rig_diagnostics = build_rig_diagnostics(&document, &file_name, &node_names, &rig_profile, &target_node_names);
   let animation_names = document
     .animations()
     .enumerate()
@@ -1123,11 +1689,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
 
   Ok(GlbSummary {
     file_path: canonical_path.to_string_lossy().to_string(),
-    file_name: canonical_path
-      .file_name()
-      .and_then(|value| value.to_str())
-      .unwrap_or("Unnamed model")
-      .to_string(),
+    file_name,
     size_bytes: metadata.len(),
     scene_count: scene_names.len(),
     node_count,
@@ -1197,6 +1759,18 @@ async fn generate_rig_proposal(input: GenerateRigProposalInput) -> Result<RigPro
 }
 
 #[tauri::command]
+async fn generate_rig_upgrade_plan(input: GenerateRigUpgradeInput) -> Result<RigUpgradePlan, String> {
+  match openai_rig_upgrade_plan(&input.summary, &input.proposal).await {
+    Ok(Some(plan)) => Ok(plan),
+    Ok(None) => Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal)),
+    Err(error) => {
+      log::warn!("OpenAI rig upgrade generation failed, using fallback plan: {error}");
+      Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal))
+    }
+  }
+}
+
+#[tauri::command]
 fn list_saved_animation_clips(app_handle: tauri::AppHandle) -> Result<Vec<SavedAnimationClip>, String> {
   read_saved_animation_clips(&app_handle)
 }
@@ -1253,6 +1827,7 @@ pub fn run() {
       read_glb_binary,
       generate_animation_recipe,
       generate_rig_proposal,
+      generate_rig_upgrade_plan,
       list_saved_animation_clips,
       save_animation_clip,
       write_binary_file

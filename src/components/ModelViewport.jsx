@@ -318,6 +318,760 @@ function cloneSceneForPlayback(scene) {
   return cloneSkeleton(scene)
 }
 
+function summarizeVector(vector) {
+  return {
+    x: Number(vector.x.toFixed(4)),
+    y: Number(vector.y.toFixed(4)),
+    z: Number(vector.z.toFixed(4)),
+  }
+}
+
+function classifyMeshRegion(centerY, minY, maxY) {
+  const height = Math.max(maxY - minY, 0.001)
+  const normalizedY = (centerY - minY) / height
+
+  if (normalizedY > 0.88) {
+    return 'head'
+  }
+
+  if (normalizedY > 0.72) {
+    return 'upper-torso'
+  }
+
+  if (normalizedY > 0.48) {
+    return 'core'
+  }
+
+  if (normalizedY > 0.24) {
+    return 'legs'
+  }
+
+  return 'feet'
+}
+
+function analyzeSceneGeometry(scene) {
+  scene.updateMatrixWorld(true)
+  const overallBox = new THREE.Box3().setFromObject(scene)
+
+  if (overallBox.isEmpty()) {
+    throw new Error('The loaded scene does not have measurable geometry bounds.')
+  }
+
+  const size = overallBox.getSize(new THREE.Vector3())
+  const center = overallBox.getCenter(new THREE.Vector3())
+  const meshRegions = []
+  const regionBuckets = {
+    core: [],
+    feet: [],
+    head: [],
+    legs: [],
+    'upper-torso': [],
+  }
+  let meshCount = 0
+  let skinnedMeshCount = 0
+  let triangleCount = 0
+
+  scene.traverse((node) => {
+    if (!node.isMesh) {
+      return
+    }
+
+    meshCount += 1
+
+    if (node.isSkinnedMesh) {
+      skinnedMeshCount += 1
+    }
+
+    if (node.geometry?.index) {
+      triangleCount += node.geometry.index.count / 3
+    } else if (node.geometry?.attributes?.position) {
+      triangleCount += node.geometry.attributes.position.count / 3
+    }
+
+    const meshBox = new THREE.Box3().setFromObject(node)
+
+    if (meshBox.isEmpty()) {
+      return
+    }
+
+    const meshSize = meshBox.getSize(new THREE.Vector3())
+    const meshCenter = meshBox.getCenter(new THREE.Vector3())
+    meshRegions.push({
+      center: summarizeVector(meshCenter),
+      name: node.name || `Mesh ${meshCount}`,
+      region: classifyMeshRegion(meshCenter.y, overallBox.min.y, overallBox.max.y),
+      size: summarizeVector(meshSize),
+      triangleCount: Number(
+        node.geometry?.index
+          ? (node.geometry.index.count / 3).toFixed(0)
+          : ((node.geometry?.attributes?.position?.count ?? 0) / 3).toFixed(0),
+      ),
+    })
+
+    regionBuckets[classifyMeshRegion(meshCenter.y, overallBox.min.y, overallBox.max.y)]?.push(meshCenter.clone())
+  })
+
+  meshRegions.sort((left, right) => right.center.y - left.center.y)
+  const bodyHeight = Math.max(size.y, 0.001)
+  const regionLandmarks = Object.fromEntries(
+    Object.entries(regionBuckets)
+      .filter(([, values]) => values.length)
+      .map(([regionName, values]) => {
+        const average = values.reduce((accumulator, nextValue) => accumulator.add(nextValue), new THREE.Vector3())
+        average.multiplyScalar(1 / values.length)
+        return [regionName, summarizeVector(average)]
+      }),
+  )
+
+  return {
+    bodyBands: {
+      chestY: Number((overallBox.min.y + bodyHeight * 0.72).toFixed(4)),
+      footY: Number(overallBox.min.y.toFixed(4)),
+      headY: Number((overallBox.min.y + bodyHeight * 0.94).toFixed(4)),
+      kneeY: Number((overallBox.min.y + bodyHeight * 0.24).toFixed(4)),
+      neckY: Number((overallBox.min.y + bodyHeight * 0.84).toFixed(4)),
+      pelvisY: Number((overallBox.min.y + bodyHeight * 0.46).toFixed(4)),
+    },
+    meshCount,
+    meshRegions: meshRegions.slice(0, 24),
+    overallBounds: {
+      center: summarizeVector(center),
+      max: summarizeVector(overallBox.max),
+      min: summarizeVector(overallBox.min),
+      size: summarizeVector(size),
+    },
+    regionLandmarks,
+    skinnedMeshCount,
+    triangleCount: Number(triangleCount.toFixed(0)),
+  }
+}
+
+function cloneMaterial(material) {
+  if (Array.isArray(material)) {
+    return material.map((entry) => (entry?.clone ? entry.clone() : entry))
+  }
+
+  return material?.clone ? material.clone() : material
+}
+
+function normalizeRigFamily(rigFamily) {
+  if (!rigFamily) {
+    return 'humanoid'
+  }
+
+  const normalized = String(rigFamily).trim().toLowerCase()
+
+  if (['humanoid', 'human', 'biped'].includes(normalized)) {
+    return 'humanoid'
+  }
+
+  if (['quadruped', 'canine', 'feline', 'equine'].includes(normalized)) {
+    return 'quadruped'
+  }
+
+  if (['arachnid', 'spider', 'insectoid'].includes(normalized)) {
+    return 'arachnid'
+  }
+
+  if (['prop', 'object', 'mechanical'].includes(normalized)) {
+    return 'prop'
+  }
+
+  if (['generic-creature', 'creature', 'animal', 'beast'].includes(normalized)) {
+    return 'generic-creature'
+  }
+
+  return 'humanoid'
+}
+
+function dominantHorizontalAxes(size) {
+  return size.z >= size.x
+    ? { forwardAxis: 'z', lateralAxis: 'x' }
+    : { forwardAxis: 'x', lateralAxis: 'z' }
+}
+
+function makeHorizontalPoint(center, axes, lateralValue, y, forwardValue) {
+  if (axes.forwardAxis === 'z') {
+    return new THREE.Vector3(lateralValue, y, forwardValue)
+  }
+
+  return new THREE.Vector3(forwardValue, y, lateralValue)
+}
+
+function projectHorizontalAxes(vector, axes) {
+  return {
+    forward: axes.forwardAxis === 'z' ? vector.z : vector.x,
+    lateral: axes.lateralAxis === 'x' ? vector.x : vector.z,
+  }
+}
+
+function buildHumanoidAnchorMap(geometryAnalysis) {
+  const min = geometryAnalysis.overallBounds.min
+  const center = geometryAnalysis.overallBounds.center
+  const size = geometryAnalysis.overallBounds.size
+  const width = Math.max(size.x, 0.2)
+  const depth = Math.max(size.z, 0.15)
+  const height = Math.max(size.y, 0.2)
+  const pelvisY = min.y + height * 0.46
+  const chestY = min.y + height * 0.72
+  const neckY = min.y + height * 0.84
+  const headY = min.y + height * 0.93
+  const legSpread = width * 0.1
+  const shoulderSpread = width * 0.18
+  const armReach = width * 0.58
+  const headLandmark = geometryAnalysis.regionLandmarks?.head
+  const torsoLandmark = geometryAnalysis.regionLandmarks?.['upper-torso']
+  const coreLandmark = geometryAnalysis.regionLandmarks?.core
+  const legsLandmark = geometryAnalysis.regionLandmarks?.legs
+  const feetLandmark = geometryAnalysis.regionLandmarks?.feet
+  const landmarkCenterX = torsoLandmark?.x ?? coreLandmark?.x ?? center.x
+  const landmarkCenterZ = torsoLandmark?.z ?? coreLandmark?.z ?? center.z
+
+  return {
+    root: new THREE.Vector3(landmarkCenterX, feetLandmark?.y ?? min.y + height * 0.04, landmarkCenterZ),
+    pelvis: new THREE.Vector3(coreLandmark?.x ?? landmarkCenterX, coreLandmark?.y ?? pelvisY, coreLandmark?.z ?? landmarkCenterZ),
+    spine: new THREE.Vector3(torsoLandmark?.x ?? landmarkCenterX, coreLandmark?.y ?? min.y + height * 0.58, torsoLandmark?.z ?? landmarkCenterZ),
+    chest: new THREE.Vector3(torsoLandmark?.x ?? landmarkCenterX, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
+    neck: new THREE.Vector3(headLandmark?.x ?? landmarkCenterX, headLandmark?.y ?? neckY, headLandmark?.z ?? landmarkCenterZ),
+    head: new THREE.Vector3(headLandmark?.x ?? landmarkCenterX, headLandmark?.y ?? headY, headLandmark?.z ?? landmarkCenterZ),
+    jaw: new THREE.Vector3(headLandmark?.x ?? landmarkCenterX, (headLandmark?.y ?? min.y + height * 0.965), (headLandmark?.z ?? landmarkCenterZ) + depth * 0.08),
+    leftShoulder: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - shoulderSpread, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
+    leftUpperArm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - width * 0.32, (torsoLandmark?.y ?? chestY) - height * 0.015, torsoLandmark?.z ?? landmarkCenterZ),
+    leftForearm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - width * 0.47, (torsoLandmark?.y ?? chestY) - height * 0.035, torsoLandmark?.z ?? landmarkCenterZ),
+    leftHand: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - armReach, (torsoLandmark?.y ?? chestY) - height * 0.05, torsoLandmark?.z ?? landmarkCenterZ),
+    rightShoulder: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + shoulderSpread, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
+    rightUpperArm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + width * 0.32, (torsoLandmark?.y ?? chestY) - height * 0.015, torsoLandmark?.z ?? landmarkCenterZ),
+    rightForearm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + width * 0.47, (torsoLandmark?.y ?? chestY) - height * 0.035, torsoLandmark?.z ?? landmarkCenterZ),
+    rightHand: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + armReach, (torsoLandmark?.y ?? chestY) - height * 0.05, torsoLandmark?.z ?? landmarkCenterZ),
+    leftThigh: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) - legSpread, legsLandmark?.y ?? min.y + height * 0.36, legsLandmark?.z ?? landmarkCenterZ),
+    leftCalf: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) - legSpread, (legsLandmark?.y ?? min.y + height * 0.18) - height * 0.16, legsLandmark?.z ?? landmarkCenterZ),
+    leftFoot: new THREE.Vector3((feetLandmark?.x ?? landmarkCenterX) - legSpread, feetLandmark?.y ?? min.y + height * 0.03, (feetLandmark?.z ?? landmarkCenterZ) + depth * 0.12),
+    rightThigh: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) + legSpread, legsLandmark?.y ?? min.y + height * 0.36, legsLandmark?.z ?? landmarkCenterZ),
+    rightCalf: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) + legSpread, (legsLandmark?.y ?? min.y + height * 0.18) - height * 0.16, legsLandmark?.z ?? landmarkCenterZ),
+    rightFoot: new THREE.Vector3((feetLandmark?.x ?? landmarkCenterX) + legSpread, feetLandmark?.y ?? min.y + height * 0.03, (feetLandmark?.z ?? landmarkCenterZ) + depth * 0.12),
+  }
+}
+
+function buildQuadrupedAnchorMap(geometryAnalysis) {
+  const min = geometryAnalysis.overallBounds.min
+  const max = geometryAnalysis.overallBounds.max
+  const center = geometryAnalysis.overallBounds.center
+  const size = geometryAnalysis.overallBounds.size
+  const axes = dominantHorizontalAxes(size)
+  const projectedCenter = projectHorizontalAxes(center, axes)
+  const forwardMin = axes.forwardAxis === 'z' ? min.z : min.x
+  const forwardMax = axes.forwardAxis === 'z' ? max.z : max.x
+  const lateralCenter = projectedCenter.lateral
+  const length = Math.max(forwardMax - forwardMin, 0.3)
+  const width = Math.max(axes.lateralAxis === 'x' ? size.x : size.z, 0.2)
+  const height = Math.max(size.y, 0.2)
+  const headLandmark = geometryAnalysis.regionLandmarks?.head
+  const torsoLandmark = geometryAnalysis.regionLandmarks?.['upper-torso']
+  const coreLandmark = geometryAnalysis.regionLandmarks?.core
+  const feetLandmark = geometryAnalysis.regionLandmarks?.feet
+  const frontForward = projectedCenter.forward + length * 0.24
+  const hindForward = projectedCenter.forward - length * 0.22
+  const headForward = projectedCenter.forward + length * 0.46
+  const tailForward = projectedCenter.forward - length * 0.46
+  const bodyY = torsoLandmark?.y ?? min.y + height * 0.62
+  const pelvisY = coreLandmark?.y ?? min.y + height * 0.56
+  const footY = feetLandmark?.y ?? min.y + height * 0.04
+  const headY = headLandmark?.y ?? min.y + height * 0.76
+  const shoulderSpread = width * 0.26
+  const hipSpread = width * 0.21
+
+  return {
+    root: makeHorizontalPoint(center, axes, lateralCenter, footY, projectedCenter.forward),
+    pelvis: makeHorizontalPoint(center, axes, coreLandmark?.x ?? lateralCenter, pelvisY, hindForward + length * 0.12),
+    spineLower: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, bodyY, projectedCenter.forward - length * 0.05),
+    spineUpper: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, bodyY + height * 0.03, projectedCenter.forward + length * 0.12),
+    neck: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, bodyY + height * 0.08, projectedCenter.forward + length * 0.28),
+    head: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY, headForward),
+    jaw: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY - height * 0.03, headForward + length * 0.05),
+    frontLeftShoulder: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, bodyY, frontForward),
+    frontLeftUpperLeg: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, min.y + height * 0.45, frontForward),
+    frontLeftLowerLeg: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, min.y + height * 0.2, frontForward + length * 0.02),
+    frontLeftFoot: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, footY, frontForward + length * 0.06),
+    frontRightShoulder: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, bodyY, frontForward),
+    frontRightUpperLeg: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, min.y + height * 0.45, frontForward),
+    frontRightLowerLeg: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, min.y + height * 0.2, frontForward + length * 0.02),
+    frontRightFoot: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, footY, frontForward + length * 0.06),
+    hindLeftHip: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, pelvisY, hindForward),
+    hindLeftUpperLeg: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, min.y + height * 0.42, hindForward),
+    hindLeftLowerLeg: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, min.y + height * 0.19, hindForward - length * 0.02),
+    hindLeftFoot: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, footY, hindForward - length * 0.03),
+    hindRightHip: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, pelvisY, hindForward),
+    hindRightUpperLeg: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, min.y + height * 0.42, hindForward),
+    hindRightLowerLeg: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, min.y + height * 0.19, hindForward - length * 0.02),
+    hindRightFoot: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, footY, hindForward - length * 0.03),
+    tailBase: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.02, hindForward - length * 0.12),
+    tailTip: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.1, tailForward),
+  }
+}
+
+function buildArachnidAnchorMap(geometryAnalysis) {
+  const min = geometryAnalysis.overallBounds.min
+  const max = geometryAnalysis.overallBounds.max
+  const center = geometryAnalysis.overallBounds.center
+  const size = geometryAnalysis.overallBounds.size
+  const axes = dominantHorizontalAxes(size)
+  const projectedCenter = projectHorizontalAxes(center, axes)
+  const forwardMin = axes.forwardAxis === 'z' ? min.z : min.x
+  const forwardMax = axes.forwardAxis === 'z' ? max.z : max.x
+  const width = Math.max(axes.lateralAxis === 'x' ? size.x : size.z, 0.25)
+  const height = Math.max(size.y, 0.15)
+  const length = Math.max(forwardMax - forwardMin, 0.25)
+  const thoraxY = min.y + height * 0.5
+  const legY = min.y + height * 0.12
+  const lateralReach = width * 0.62
+  const forwardOffsets = [0.32, 0.12, -0.1, -0.3]
+  const names = [
+    ['frontLeftLegA', 'frontRightLegA'],
+    ['frontLeftLegB', 'frontRightLegB'],
+    ['midLeftLegA', 'midRightLegA'],
+    ['midLeftLegB', 'midRightLegB'],
+    ['rearLeftLegA', 'rearRightLegA'],
+    ['rearLeftLegB', 'rearRightLegB'],
+    ['backLeftLegA', 'backRightLegA'],
+    ['backLeftLegB', 'backRightLegB'],
+  ]
+  const anchorMap = {
+    root: makeHorizontalPoint(center, axes, projectedCenter.lateral, min.y + height * 0.08, projectedCenter.forward),
+    abdomen: makeHorizontalPoint(center, axes, projectedCenter.lateral, thoraxY - height * 0.02, projectedCenter.forward - length * 0.16),
+    thorax: makeHorizontalPoint(center, axes, projectedCenter.lateral, thoraxY, projectedCenter.forward),
+    head: makeHorizontalPoint(center, axes, projectedCenter.lateral, thoraxY + height * 0.02, projectedCenter.forward + length * 0.18),
+  }
+
+  names.forEach(([leftName, rightName], index) => {
+    const lane = Math.floor(index / 2)
+    const forwardValue = projectedCenter.forward + length * forwardOffsets[lane]
+    const isOuter = index % 2 === 0
+    anchorMap[leftName] = makeHorizontalPoint(
+      center,
+      axes,
+      projectedCenter.lateral - lateralReach - (isOuter ? width * 0.12 : width * 0.22),
+      legY,
+      forwardValue,
+    )
+    anchorMap[rightName] = makeHorizontalPoint(
+      center,
+      axes,
+      projectedCenter.lateral + lateralReach + (isOuter ? width * 0.12 : width * 0.22),
+      legY,
+      forwardValue,
+    )
+  })
+
+  return anchorMap
+}
+
+function buildPropAnchorMap(geometryAnalysis) {
+  const min = geometryAnalysis.overallBounds.min
+  const max = geometryAnalysis.overallBounds.max
+  const center = geometryAnalysis.overallBounds.center
+  const size = geometryAnalysis.overallBounds.size
+  const axes = dominantHorizontalAxes(size)
+  const forwardMin = axes.forwardAxis === 'z' ? min.z : min.x
+  const forwardMax = axes.forwardAxis === 'z' ? max.z : max.x
+  const projectedCenter = projectHorizontalAxes(center, axes)
+  const tipForward = projectedCenter.forward + (forwardMax - forwardMin) * 0.42
+  return {
+    root: makeHorizontalPoint(center, axes, projectedCenter.lateral, min.y, projectedCenter.forward - (forwardMax - forwardMin) * 0.2),
+    body: makeHorizontalPoint(center, axes, projectedCenter.lateral, center.y, projectedCenter.forward),
+    pivot: makeHorizontalPoint(center, axes, projectedCenter.lateral, center.y, projectedCenter.forward + (forwardMax - forwardMin) * 0.18),
+    tip: makeHorizontalPoint(center, axes, projectedCenter.lateral, max.y, tipForward),
+  }
+}
+
+function buildGenericCreatureAnchorMap(geometryAnalysis) {
+  const quadrupedMap = buildQuadrupedAnchorMap(geometryAnalysis)
+  return {
+    root: quadrupedMap.root,
+    body: quadrupedMap.spineLower,
+    neck: quadrupedMap.neck,
+    head: quadrupedMap.head,
+    frontLeftLimb: quadrupedMap.frontLeftUpperLeg,
+    frontRightLimb: quadrupedMap.frontRightUpperLeg,
+    rearLeftLimb: quadrupedMap.hindLeftUpperLeg,
+    rearRightLimb: quadrupedMap.hindRightUpperLeg,
+    tailBase: quadrupedMap.tailBase,
+    tailTip: quadrupedMap.tailTip,
+  }
+}
+
+function buildRigDefinition(geometryAnalysis, rigFamily) {
+  const family = normalizeRigFamily(rigFamily)
+
+  switch (family) {
+    case 'quadruped':
+      return {
+        anchorMap: buildQuadrupedAnchorMap(geometryAnalysis),
+        boneTree: [
+          ['pelvis', 'root'],
+          ['spineLower', 'pelvis'],
+          ['spineUpper', 'spineLower'],
+          ['neck', 'spineUpper'],
+          ['head', 'neck'],
+          ['jaw', 'head'],
+          ['frontLeftShoulder', 'spineUpper'],
+          ['frontLeftUpperLeg', 'frontLeftShoulder'],
+          ['frontLeftLowerLeg', 'frontLeftUpperLeg'],
+          ['frontLeftFoot', 'frontLeftLowerLeg'],
+          ['frontRightShoulder', 'spineUpper'],
+          ['frontRightUpperLeg', 'frontRightShoulder'],
+          ['frontRightLowerLeg', 'frontRightUpperLeg'],
+          ['frontRightFoot', 'frontRightLowerLeg'],
+          ['hindLeftHip', 'pelvis'],
+          ['hindLeftUpperLeg', 'hindLeftHip'],
+          ['hindLeftLowerLeg', 'hindLeftUpperLeg'],
+          ['hindLeftFoot', 'hindLeftLowerLeg'],
+          ['hindRightHip', 'pelvis'],
+          ['hindRightUpperLeg', 'hindRightHip'],
+          ['hindRightLowerLeg', 'hindRightUpperLeg'],
+          ['hindRightFoot', 'hindRightLowerLeg'],
+          ['tailBase', 'pelvis'],
+          ['tailTip', 'tailBase'],
+        ],
+        color: '#8ad7ff',
+        family,
+      }
+    case 'arachnid':
+      return {
+        anchorMap: buildArachnidAnchorMap(geometryAnalysis),
+        boneTree: [
+          ['abdomen', 'root'],
+          ['thorax', 'abdomen'],
+          ['head', 'thorax'],
+          ['frontLeftLegA', 'thorax'],
+          ['frontLeftLegB', 'frontLeftLegA'],
+          ['frontRightLegA', 'thorax'],
+          ['frontRightLegB', 'frontRightLegA'],
+          ['midLeftLegA', 'thorax'],
+          ['midLeftLegB', 'midLeftLegA'],
+          ['midRightLegA', 'thorax'],
+          ['midRightLegB', 'midRightLegA'],
+          ['rearLeftLegA', 'abdomen'],
+          ['rearLeftLegB', 'rearLeftLegA'],
+          ['backLeftLegA', 'abdomen'],
+          ['backLeftLegB', 'backLeftLegA'],
+          ['rearRightLegA', 'abdomen'],
+          ['rearRightLegB', 'rearRightLegA'],
+          ['backRightLegA', 'abdomen'],
+          ['backRightLegB', 'backRightLegA'],
+        ],
+        color: '#e07bff',
+        family,
+      }
+    case 'prop':
+      return {
+        anchorMap: buildPropAnchorMap(geometryAnalysis),
+        boneTree: [
+          ['body', 'root'],
+          ['pivot', 'body'],
+          ['tip', 'pivot'],
+        ],
+        color: '#7be0b3',
+        family,
+      }
+    case 'generic-creature':
+      return {
+        anchorMap: buildGenericCreatureAnchorMap(geometryAnalysis),
+        boneTree: [
+          ['body', 'root'],
+          ['neck', 'body'],
+          ['head', 'neck'],
+          ['frontLeftLimb', 'body'],
+          ['frontRightLimb', 'body'],
+          ['rearLeftLimb', 'body'],
+          ['rearRightLimb', 'body'],
+          ['tailBase', 'body'],
+          ['tailTip', 'tailBase'],
+        ],
+        color: '#ffb261',
+        family,
+      }
+    default:
+      return {
+        anchorMap: buildHumanoidAnchorMap(geometryAnalysis),
+        boneTree: [
+          ['pelvis', 'root'],
+          ['spine', 'pelvis'],
+          ['chest', 'spine'],
+          ['neck', 'chest'],
+          ['head', 'neck'],
+          ['jaw', 'head'],
+          ['leftShoulder', 'chest'],
+          ['leftUpperArm', 'leftShoulder'],
+          ['leftForearm', 'leftUpperArm'],
+          ['leftHand', 'leftForearm'],
+          ['rightShoulder', 'chest'],
+          ['rightUpperArm', 'rightShoulder'],
+          ['rightForearm', 'rightUpperArm'],
+          ['rightHand', 'rightForearm'],
+          ['leftThigh', 'pelvis'],
+          ['leftCalf', 'leftThigh'],
+          ['leftFoot', 'leftCalf'],
+          ['rightThigh', 'pelvis'],
+          ['rightCalf', 'rightThigh'],
+          ['rightFoot', 'rightCalf'],
+        ],
+        color: '#ffb261',
+        family,
+      }
+  }
+}
+
+function makeBone(name, absolutePosition, parentAbsolutePosition) {
+  const bone = new THREE.Bone()
+  bone.name = name
+  bone.position.copy(absolutePosition.clone().sub(parentAbsolutePosition))
+  return bone
+}
+
+function createSyntheticSkeleton(rigDefinition) {
+  const { anchorMap, boneTree } = rigDefinition
+  const rootBone = new THREE.Bone()
+  rootBone.name = 'root'
+  rootBone.position.copy(anchorMap.root)
+
+  const boneMap = { root: rootBone }
+  const boneList = [rootBone]
+
+  function addBone(slotName, parentSlot) {
+    const bone = makeBone(slotName, anchorMap[slotName], anchorMap[parentSlot])
+    boneMap[parentSlot].add(bone)
+    boneMap[slotName] = bone
+    boneList.push(bone)
+  }
+
+  boneTree.forEach(([slotName, parentSlot]) => addBone(slotName, parentSlot))
+
+  const slotIndexMap = Object.fromEntries(boneList.map((bone, index) => [bone.name, index]))
+  return { boneList, rootBone, slotIndexMap }
+}
+
+function buildRigSlotReverseMap(rigProfile) {
+  return Object.fromEntries(
+    Object.entries(rigProfile ?? {})
+      .filter(([, nodeName]) => Boolean(nodeName))
+      .map(([slotName, nodeName]) => [nodeName, slotName]),
+  )
+}
+
+function retargetRecipeToRig(recipe, rigProfile) {
+  if (!recipe?.tracks?.length) {
+    return null
+  }
+
+  const reverseRigMap = buildRigSlotReverseMap(rigProfile)
+  const tracks = recipe.tracks
+    .map((track) => ({
+      ...track,
+      targetName: track.targetName ? reverseRigMap[track.targetName] ?? track.targetName : 'root',
+    }))
+    .filter((track) => Boolean(track.targetName))
+
+  if (!tracks.length) {
+    return null
+  }
+
+  return {
+    ...recipe,
+    name: `${recipe.name || 'Rigged Motion'} Rigged`,
+    tracks,
+  }
+}
+
+function chooseBoneInfluencesForVertex(vertex, rigDefinition, geometryAnalysis) {
+  const { anchorMap, family } = rigDefinition
+  const centerX = geometryAnalysis.overallBounds.center.x
+  const size = geometryAnalysis.overallBounds.size
+  const minY = geometryAnalysis.overallBounds.min.y
+  const maxY = geometryAnalysis.overallBounds.max.y
+  const height = Math.max(maxY - minY, 0.001)
+  const vertexSide = vertex.x >= centerX ? 'right' : 'left'
+  const normalizedY = (vertex.y - minY) / height
+  const axes = dominantHorizontalAxes(size)
+  const projectedCenter = projectHorizontalAxes(geometryAnalysis.overallBounds.center, axes)
+  const projectedVertex = projectHorizontalAxes(vertex, axes)
+  const forwardMin = axes.forwardAxis === 'z' ? geometryAnalysis.overallBounds.min.z : geometryAnalysis.overallBounds.min.x
+  const forwardMax = axes.forwardAxis === 'z' ? geometryAnalysis.overallBounds.max.z : geometryAnalysis.overallBounds.max.x
+  const forwardSpan = Math.max(forwardMax - forwardMin, 0.001)
+  const normalizedForward = (projectedVertex.forward - forwardMin) / forwardSpan
+
+  return Object.entries(anchorMap)
+    .map(([slotName, anchorPosition]) => {
+      const distance = Math.max(anchorPosition.distanceTo(vertex), 0.0001)
+      let score = 1 / (distance * distance)
+
+      if ((slotName.startsWith('left') && vertexSide === 'right') || (slotName.startsWith('right') && vertexSide === 'left')) {
+        score *= 0.12
+      }
+
+      if (family === 'humanoid') {
+        if (normalizedY < 0.22 && (slotName.includes('Hand') || slotName.includes('Arm') || slotName === 'head' || slotName === 'jaw')) {
+          score *= 0.08
+        }
+
+        if (normalizedY > 0.72 && (slotName.includes('Foot') || slotName.includes('Calf') || slotName.includes('Thigh'))) {
+          score *= 0.08
+        }
+
+        if (normalizedY > 0.82 && (slotName === 'head' || slotName === 'jaw' || slotName === 'neck')) {
+          score *= 1.6
+        }
+
+        if (normalizedY > 0.58 && normalizedY < 0.82 && (slotName === 'chest' || slotName === 'spine' || slotName === 'neck')) {
+          score *= 1.35
+        }
+
+        if (normalizedY > 0.2 && normalizedY < 0.56 && (slotName === 'pelvis' || slotName.includes('Thigh'))) {
+          score *= 1.25
+        }
+      } else if (family === 'quadruped' || family === 'generic-creature') {
+        if (normalizedY < 0.22 && (slotName.includes('Leg') || slotName.includes('Foot') || slotName.includes('Limb'))) {
+          score *= 1.45
+        }
+
+        if (normalizedForward > 0.58 && (slotName.includes('front') || slotName === 'neck' || slotName === 'head' || slotName === 'jaw')) {
+          score *= 1.35
+        }
+
+        if (normalizedForward < 0.4 && (slotName.includes('hind') || slotName.includes('rear') || slotName.includes('tail') || slotName === 'pelvis')) {
+          score *= 1.35
+        }
+
+        if (normalizedY > 0.52 && (slotName.includes('spine') || slotName === 'body' || slotName === 'neck' || slotName === 'head')) {
+          score *= 1.28
+        }
+      } else if (family === 'arachnid') {
+        if (normalizedY < 0.22 && slotName.toLowerCase().includes('leg')) {
+          score *= 1.6
+        }
+
+        if (normalizedY > 0.28 && ['abdomen', 'thorax', 'head'].includes(slotName)) {
+          score *= 1.35
+        }
+
+        if (normalizedForward > 0.58 && (slotName.includes('front') || slotName === 'head')) {
+          score *= 1.3
+        }
+
+        if (normalizedForward < 0.42 && (slotName.includes('rear') || slotName.includes('back') || slotName === 'abdomen')) {
+          score *= 1.3
+        }
+      }
+
+      return { score, slotName }
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 4)
+}
+
+function assignSkinning(geometry, slotIndexMap, rigDefinition, geometryAnalysis) {
+  const positionAttribute = geometry.getAttribute('position')
+
+  if (!positionAttribute) {
+    throw new Error('The mesh geometry does not contain positions for skinning.')
+  }
+
+  const skinIndices = new Uint16Array(positionAttribute.count * 4)
+  const skinWeights = new Float32Array(positionAttribute.count * 4)
+  const vertex = new THREE.Vector3()
+
+  for (let index = 0; index < positionAttribute.count; index += 1) {
+    vertex.fromBufferAttribute(positionAttribute, index)
+    const influences = chooseBoneInfluencesForVertex(vertex, rigDefinition, geometryAnalysis)
+    const influenceTotal = influences.reduce((sum, influence) => sum + influence.score, 0) || 1
+
+    for (let influenceIndex = 0; influenceIndex < 4; influenceIndex += 1) {
+      const influence = influences[influenceIndex]
+      skinIndices[index * 4 + influenceIndex] = influence
+        ? (slotIndexMap[influence.slotName] ?? slotIndexMap.pelvis ?? 0)
+        : 0
+      skinWeights[index * 4 + influenceIndex] = influence ? influence.score / influenceTotal : 0
+    }
+  }
+
+  geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4))
+  geometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4))
+}
+
+function buildRiggedSceneFromSource(sourceScene, geometryAnalysis, upgradePlan) {
+  if (!sourceScene) {
+    throw new Error('Load a model before applying a rig upgrade.')
+  }
+
+  if (upgradePlan?.applyStrategy === 'preserve-and-remap') {
+    return {
+      metadata: {
+        createdJointCount: 0,
+        riggedMeshCount: 0,
+        strategy: 'preserve-and-remap',
+      },
+      scene: cloneSceneForPlayback(sourceScene),
+    }
+  }
+
+  const rigDefinition = buildRigDefinition(geometryAnalysis, upgradePlan?.rigFamily)
+  const exportGroup = new THREE.Group()
+  exportGroup.name = 'RigUpgradeResult'
+  let riggedMeshCount = 0
+  let createdJointCount = 0
+
+  sourceScene.updateMatrixWorld(true)
+  sourceScene.traverse((node) => {
+    if (!node.isMesh || !node.geometry?.attributes?.position) {
+      return
+    }
+
+    const geometry = node.geometry.clone()
+    geometry.applyMatrix4(node.matrixWorld)
+    const { boneList, rootBone, slotIndexMap } = createSyntheticSkeleton(rigDefinition)
+    assignSkinning(geometry, slotIndexMap, rigDefinition, geometryAnalysis)
+    const skinnedMesh = new THREE.SkinnedMesh(geometry, cloneMaterial(node.material))
+    skinnedMesh.name = node.name || `Rigged Mesh ${riggedMeshCount + 1}`
+    skinnedMesh.add(rootBone)
+    skinnedMesh.bind(new THREE.Skeleton(boneList))
+    exportGroup.add(skinnedMesh)
+    riggedMeshCount += 1
+    createdJointCount = boneList.length
+  })
+
+  if (!riggedMeshCount) {
+    throw new Error('The current model does not contain any mesh geometry that can be converted into a skinned export.')
+  }
+
+  return {
+    metadata: {
+      createdJointCount,
+      riggedMeshCount,
+      strategy: upgradePlan?.applyStrategy ?? 'generate-canonical-skeleton',
+    },
+    scene: exportGroup,
+  }
+}
+
+function buildRigPreviewGroup(geometryAnalysis, upgradePlan) {
+  const rigDefinition = buildRigDefinition(geometryAnalysis, upgradePlan?.rigFamily)
+  const { rootBone } = createSyntheticSkeleton(rigDefinition)
+  const previewGroup = new THREE.Group()
+  previewGroup.name = 'RigPreviewGroup'
+  previewGroup.add(rootBone)
+
+  const skeletonHelper = new THREE.SkeletonHelper(rootBone)
+  skeletonHelper.material.linewidth = 2
+  skeletonHelper.material.depthTest = false
+  skeletonHelper.material.transparent = true
+  skeletonHelper.material.opacity = 0.95
+  skeletonHelper.material.color.set(
+    upgradePlan?.applyStrategy === 'preserve-and-remap' ? '#7be0b3' : rigDefinition.color,
+  )
+  previewGroup.add(skeletonHelper)
+
+  return previewGroup
+}
+
 function exportGlb(scene, animations) {
   const exporter = new GLTFExporter()
 
@@ -345,7 +1099,7 @@ function exportGlb(scene, animations) {
 }
 
 const ModelViewport = forwardRef(function ModelViewport(
-  { isTauriRuntime, modelFilePath, modelUrl, recipe, onStatusChange },
+  { geometryAnalysis, isTauriRuntime, modelFilePath, modelUrl, recipe, rigPreviewEnabled, rigPreviewPlan, rigProfile, onStatusChange },
   ref,
 ) {
   const stageRef = useRef(null)
@@ -354,10 +1108,18 @@ const ModelViewport = forwardRef(function ModelViewport(
   const embeddedAnimationsRef = useRef([])
   const sourceRootRef = useRef(null)
   const sourceAnimationsRef = useRef([])
+  const rigPreviewRootRef = useRef(null)
 
   useImperativeHandle(
     ref,
     () => ({
+      analyzeRigGeometry() {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before analyzing body geometry.')
+        }
+
+        return analyzeSceneGeometry(sourceRootRef.current)
+      },
       async exportRecipeGlb(activeRecipe) {
         if (!sourceRootRef.current) {
           throw new Error('Load a model before exporting a GLB.')
@@ -381,6 +1143,49 @@ const ModelViewport = forwardRef(function ModelViewport(
         return {
           bytes: Array.from(new Uint8Array(glbBuffer)),
           defaultFileName: `${activeRecipe.name || 'generated-motion'}.glb`,
+        }
+      },
+      async applyRigUpgradePlan(activePlan, geometryAnalysisInput, activeRecipe, activeRigProfile, options = {}) {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before applying a rig upgrade.')
+        }
+
+        if (!activePlan) {
+          throw new Error('Generate a rig upgrade plan before applying it.')
+        }
+
+        const resolvedGeometryAnalysis = geometryAnalysisInput ?? analyzeSceneGeometry(sourceRootRef.current)
+        const { metadata, scene } = buildRiggedSceneFromSource(
+          sourceRootRef.current,
+          resolvedGeometryAnalysis,
+          activePlan,
+        )
+        const riggedRecipe = retargetRecipeToRig(activeRecipe, activeRigProfile)
+        const animations = []
+
+        if (options.includeEmbeddedSourceClips && activePlan?.applyStrategy === 'preserve-and-remap') {
+          animations.push(...sourceAnimationsRef.current.map((animation) => animation.clone()))
+        }
+
+        if (riggedRecipe) {
+          animations.push(...[makeClip(riggedRecipe, scene)].filter(Boolean))
+        }
+        const glbBuffer = await exportGlb(scene, animations)
+        const generatedRig = createSyntheticSkeleton(
+          buildRigDefinition(resolvedGeometryAnalysis, activePlan?.rigFamily),
+        )
+
+        return {
+          defaultBaseName: 'rig-upgrade-result',
+          generatedBoneNames: generatedRig.boneList.map((bone) => bone.name),
+          geometryAnalysis: resolvedGeometryAnalysis,
+          includedSourceAnimationCount:
+            options.includeEmbeddedSourceClips && activePlan?.applyStrategy === 'preserve-and-remap'
+              ? sourceAnimationsRef.current.length
+              : 0,
+          metadata,
+          riggedAnimationCount: animations.length,
+          riggedGlbBytes: Array.from(new Uint8Array(glbBuffer)),
         }
       },
     }),
@@ -490,6 +1295,7 @@ const ModelViewport = forwardRef(function ModelViewport(
       embeddedAnimationsRef.current = []
       sourceRootRef.current = null
       sourceAnimationsRef.current = []
+      rigPreviewRootRef.current = null
     }
   }, [])
 
@@ -606,8 +1412,42 @@ const ModelViewport = forwardRef(function ModelViewport(
       embeddedAnimationsRef.current = []
       sourceRootRef.current = null
       sourceAnimationsRef.current = []
+      rigPreviewRootRef.current = null
     }
   }, [isTauriRuntime, modelFilePath, modelUrl, onStatusChange])
+
+  useEffect(() => {
+    const runtime = runtimeRef.current
+
+    if (!runtime) {
+      return undefined
+    }
+
+    if (rigPreviewRootRef.current) {
+      runtime.scene.remove(rigPreviewRootRef.current)
+      rigPreviewRootRef.current = null
+    }
+
+    if (!rigPreviewEnabled || !sourceRootRef.current || !rigPreviewPlan) {
+      return undefined
+    }
+
+    try {
+      const resolvedGeometryAnalysis = geometryAnalysis ?? analyzeSceneGeometry(sourceRootRef.current)
+      const previewGroup = buildRigPreviewGroup(resolvedGeometryAnalysis, rigPreviewPlan)
+      runtime.scene.add(previewGroup)
+      rigPreviewRootRef.current = previewGroup
+    } catch {
+      rigPreviewRootRef.current = null
+    }
+
+    return () => {
+      if (rigPreviewRootRef.current) {
+        runtime.scene.remove(rigPreviewRootRef.current)
+        rigPreviewRootRef.current = null
+      }
+    }
+  }, [geometryAnalysis, rigPreviewEnabled, rigPreviewPlan])
 
   useEffect(() => {
     const runtime = runtimeRef.current

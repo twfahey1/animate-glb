@@ -12,6 +12,7 @@ Desktop MVP for loading a GLB or GLTF file, previewing it in Three.js, and gener
 - Local clip library for saving generated recipes per source model
 - Export action that writes a new GLB with the generated clip embedded as a native animation
 - Rig diagnostics that classify loaded assets as rigged, partial, or unrigged
+- Rig-family detection for humanoid, quadruped, arachnid, creature, and prop-like assets
 - Rig proposal analysis with optional OpenAI assistance and a local fallback proposal path
 - Optional OpenAI-backed recipe generation when `OPENAI_API_KEY` is present
 - Deterministic local fallback recipe generator when no AI credentials are configured
@@ -73,21 +74,25 @@ The next major feature after animation export is an AI-assisted rigging workflow
 Current implemented slice:
 
 - Diagnose the asset's current rig state from glTF metadata
-- Infer a canonical humanoid rig profile from discovered node names
-- Generate a cautious rig proposal with confidence, unresolved slots, recommendations, and warnings
+- Infer a canonical rig family from discovered node names and model cues so quadrupeds and other non-human assets are not forced into a humanoid plan
+- Generate a cautious rig proposal with confidence, unresolved slots, recommendations, and warnings for the detected family
+- Generate a non-destructive rig upgrade plan that describes whether to preserve, remap, or create canonical joint chains for that family
+- Analyze loaded mesh geometry into rough body regions inside the Three.js viewport
+- Preview the generated family-aware rig in the viewport before export
+- Apply a heuristic rig upgrade that exports a derived rigged GLB plus a sidecar rig package and can embed the current generated animation clip
 - Keep the workflow analysis-only and non-destructive for now
 
 Not implemented yet:
 
-- Writing a newly rigged skeleton back into the asset
-- Generating or rebinding skin weights
-- Applying an AI rig proposal directly to the source model
+- Production-grade joint placement from mesh topology
+- Robust automatic skin-weight generation suitable for final character work
+- Direct in-place mutation of the original source model
 
 Goal:
 
-- Take a source GLB that lacks a clean humanoid rig
+- Take a source GLB that lacks a clean animation-ready rig, whether it is humanoid, quadruped, arachnid, or another articulated form
 - Analyze the mesh, hierarchy, and proportions
-- Infer a canonical skeleton layout
+- Infer a canonical skeleton layout for the detected family
 - Bind the mesh to that skeleton
 - Produce a rig profile that can drive prompt-generated animation and export cleanly to downstream tools
 
@@ -99,13 +104,13 @@ Proposed implementation phases:
 	- Surface rig-health metadata in the UI before attempting rigging
 
 2. Canonical body inference
-	- Use node names, scene hierarchy, and mesh bounds to estimate head, chest, pelvis, hands, legs, and feet
+	- Use node names, scene hierarchy, and mesh bounds to estimate the correct body plan for the detected family
 	- Build confidence scores for each inferred body region
 	- Store the result as an explicit rig analysis object
 
 3. AI rig proposal
 	- Feed the asset summary and inferred body layout into an AI prompt
-	- Ask for a proposed humanoid skeleton map, side labeling, and joint placement strategy
+	- Ask for a proposed family-appropriate skeleton map, side labeling, and joint placement strategy
 	- Keep the proposal inspectable instead of applying it blindly
 
 4. Skeleton generation and binding
@@ -131,3 +136,7 @@ Initial constraints to respect:
 - Add an "apply rig proposal" workflow after the proposal review step exists
 - Design mesh-binding and skin-weight generation for assets that currently have no skin data
 - Add tests around prompt parsing, target matching, export generation, and GLB metadata extraction
+
+## License
+
+MIT. See [LICENSE](./LICENSE).
