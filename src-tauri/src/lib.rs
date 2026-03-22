@@ -75,6 +75,55 @@ fn track(binding: &str, points: &[(f32, f32)]) -> AnimationTrack {
   }
 }
 
+fn normalize_binding(binding: &str) -> Option<String> {
+  let lower = binding.trim().to_ascii_lowercase();
+
+  if lower.is_empty() {
+    return None;
+  }
+
+  let variants = [
+    ("position", "x", ".position[x]"),
+    ("position", "y", ".position[y]"),
+    ("position", "z", ".position[z]"),
+    ("rotation", "x", ".rotation[x]"),
+    ("rotation", "y", ".rotation[y]"),
+    ("rotation", "z", ".rotation[z]"),
+    ("scale", "x", ".scale[x]"),
+    ("scale", "y", ".scale[y]"),
+    ("scale", "z", ".scale[z]"),
+  ];
+
+  for (property, axis, canonical) in variants {
+    let compact_patterns = [
+      format!(".{property}[{axis}]"),
+      format!(".{property}.{axis}"),
+      format!("{property}[{axis}]"),
+      format!("{property}.{axis}"),
+      format!("{property}{axis}"),
+      format!("{property}_{axis}"),
+      format!("{property}-{axis}"),
+    ];
+
+    if compact_patterns.iter().any(|pattern| lower == *pattern || lower.ends_with(pattern)) {
+      return Some(canonical.to_string());
+    }
+
+    let path_patterns = [
+      format!(".{property}[{axis}]"),
+      format!(".{property}.{axis}"),
+      format!("/{property}/{axis}"),
+      format!("::{property}::{axis}"),
+    ];
+
+    if path_patterns.iter().any(|pattern| lower.contains(pattern)) {
+      return Some(canonical.to_string());
+    }
+  }
+
+  None
+}
+
 fn fallback_recipe(prompt: &str) -> AnimationRecipe {
   let normalized = prompt.to_lowercase();
   let duration_seconds = if normalized.contains("slow") {
@@ -186,24 +235,23 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
 }
 
 fn sanitize_recipe(mut recipe: AnimationRecipe) -> AnimationRecipe {
-  const ALLOWED_BINDINGS: [&str; 9] = [
-    ".position[x]",
-    ".position[y]",
-    ".position[z]",
-    ".rotation[x]",
-    ".rotation[y]",
-    ".rotation[z]",
-    ".scale[x]",
-    ".scale[y]",
-    ".scale[z]",
-  ];
-
   recipe.duration_seconds = recipe.duration_seconds.clamp(0.5, 12.0);
   recipe.tracks = recipe
     .tracks
     .into_iter()
-    .filter(|track| ALLOWED_BINDINGS.contains(&track.binding.as_str()))
-    .filter(|track| !track.times.is_empty() && track.times.len() == track.values.len())
+    .filter_map(|mut track| {
+      track.binding = normalize_binding(&track.binding)?;
+
+      if track.times.is_empty() || track.times.len() != track.values.len() {
+        return None;
+      }
+
+      if track.interpolation.trim().is_empty() {
+        track.interpolation = "smooth".to_string();
+      }
+
+      Some(track)
+    })
     .take(12)
     .collect();
 
@@ -276,7 +324,16 @@ async fn openai_recipe(prompt: &str, summary: &GlbSummary) -> Result<Option<Anim
     .map_err(|error| format!("OpenAI returned invalid JSON for an animation recipe: {error}"))?;
   recipe.source = "openai".to_string();
 
-  Ok(Some(sanitize_recipe(recipe)))
+  let sanitized = sanitize_recipe(recipe);
+
+  if sanitized.tracks.is_empty() {
+    let mut fallback = fallback_recipe(prompt);
+    fallback.source = "openai-fallback".to_string();
+    fallback.rationale = "OpenAI returned a recipe, but its track bindings could not be mapped into the current viewer. Applied a local playable fallback instead.".to_string();
+    return Ok(Some(fallback));
+  }
+
+  Ok(Some(sanitized))
 }
 
 #[tauri::command]
