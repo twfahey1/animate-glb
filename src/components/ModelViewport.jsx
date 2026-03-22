@@ -86,6 +86,39 @@ function findTargetObject(root, targetName) {
   return fallbackMatch
 }
 
+function parseBinding(binding) {
+  const match = binding.match(/^\.(position|rotation|scale)\[([xyz])\]$/)
+
+  if (!match) {
+    return null
+  }
+
+  return {
+    axis: match[2],
+    property: match[1],
+  }
+}
+
+function absoluteTrackValues(targetObject, binding, relativeValues) {
+  const parsedBinding = parseBinding(binding)
+
+  if (!parsedBinding) {
+    return relativeValues
+  }
+
+  const baseline = targetObject[parsedBinding.property]?.[parsedBinding.axis]
+
+  if (!Number.isFinite(baseline)) {
+    return relativeValues
+  }
+
+  if (parsedBinding.property === 'scale') {
+    return relativeValues.map((value) => baseline * value)
+  }
+
+  return relativeValues.map((value) => baseline + value)
+}
+
 function makeClip(recipe, activeRoot) {
   if (!recipe?.tracks?.length) {
     return null
@@ -99,10 +132,12 @@ function makeClip(recipe, activeRoot) {
         return null
       }
 
+      const absoluteValues = absoluteTrackValues(targetObject, track.binding, track.values)
+
       return new THREE.NumberKeyframeTrack(
         `${targetObject.uuid}${track.binding}`,
         Float32Array.from(track.times),
-        Float32Array.from(track.values),
+        Float32Array.from(absoluteValues),
         track.interpolation === 'linear' ? THREE.InterpolateLinear : THREE.InterpolateSmooth,
       )
     })

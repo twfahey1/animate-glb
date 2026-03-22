@@ -302,30 +302,25 @@ fn fallback_recipe(prompt: &str, summary: &GlbSummary) -> AnimationRecipe {
 
   let mut tracks = vec![
     targeted_track(
-      torso_target.clone(),
+      None,
       ".position[y]",
       &[
         (0.0, 0.0),
-        (duration_seconds * 0.25, 0.06),
+        (duration_seconds * 0.25, 0.02),
         (duration_seconds * 0.5, 0.0),
-        (duration_seconds * 0.75, 0.07),
+        (duration_seconds * 0.75, 0.02),
         (duration_seconds, 0.0),
       ],
     ),
     targeted_track(
       torso_target.clone(),
-      ".scale[x]",
-      &[(0.0, 1.0), (duration_seconds * 0.5, 1.02), (duration_seconds, 1.0)],
+      ".rotation[x]",
+      &[(0.0, 0.0), (duration_seconds * 0.5, 0.05), (duration_seconds, 0.0)],
     ),
     targeted_track(
       torso_target.clone(),
-      ".scale[y]",
-      &[(0.0, 1.0), (duration_seconds * 0.5, 1.03), (duration_seconds, 1.0)],
-    ),
-    targeted_track(
-      torso_target.clone(),
-      ".scale[z]",
-      &[(0.0, 1.0), (duration_seconds * 0.5, 1.02), (duration_seconds, 1.0)],
+      ".rotation[z]",
+      &[(0.0, 0.0), (duration_seconds * 0.25, 0.02), (duration_seconds * 0.75, -0.02), (duration_seconds, 0.0)],
     ),
   ];
 
@@ -351,7 +346,7 @@ fn fallback_recipe(prompt: &str, summary: &GlbSummary) -> AnimationRecipe {
       &[
         (0.0, 0.0),
         (duration_seconds * 0.18, 0.0),
-        (duration_seconds * 0.34, 0.42),
+        (duration_seconds * 0.34, 0.12),
         (duration_seconds * 0.5, 0.0),
         (duration_seconds, 0.0),
       ],
@@ -372,13 +367,13 @@ fn fallback_recipe(prompt: &str, summary: &GlbSummary) -> AnimationRecipe {
       ],
     ));
     tracks.push(targeted_track(
-      torso_target.clone(),
+      None,
       ".position[x]",
       &[
         (0.0, 0.0),
-        (duration_seconds * 0.25, 0.12),
+        (duration_seconds * 0.25, 0.04),
         (duration_seconds * 0.5, 0.0),
-        (duration_seconds * 0.75, -0.12),
+        (duration_seconds * 0.75, -0.04),
         (duration_seconds, 0.0),
       ],
     ));
@@ -428,13 +423,13 @@ fn fallback_recipe(prompt: &str, summary: &GlbSummary) -> AnimationRecipe {
       ],
     ));
     tracks.push(targeted_track(
-      torso_target.clone(),
+      None,
       ".position[y]",
       &[
         (0.0, 0.0),
-        (duration_seconds * 0.22, 0.04),
+        (duration_seconds * 0.22, 0.015),
         (duration_seconds * 0.44, 0.0),
-        (duration_seconds * 0.66, 0.03),
+        (duration_seconds * 0.66, 0.012),
         (duration_seconds, 0.0),
       ],
     ));
@@ -478,8 +473,36 @@ fn sanitize_recipe(mut recipe: AnimationRecipe, summary: &GlbSummary) -> Animati
         .as_deref()
         .and_then(|requested_name| find_matching_target_name(requested_name, summary));
 
+      if track.target_name.is_some() && !track.binding.starts_with(".rotation[") {
+        return None;
+      }
+
       if track.times.is_empty() || track.times.len() != track.values.len() {
         return None;
+      }
+
+      if track.binding.starts_with(".position[") {
+        track.values = track
+          .values
+          .into_iter()
+          .map(|value| value.clamp(-0.08, 0.08))
+          .collect();
+      }
+
+      if track.binding.starts_with(".rotation[") {
+        track.values = track
+          .values
+          .into_iter()
+          .map(|value| value.clamp(-0.75, 0.75))
+          .collect();
+      }
+
+      if track.binding.starts_with(".scale[") {
+        track.values = track
+          .values
+          .into_iter()
+          .map(|value| value.clamp(0.92, 1.08))
+          .collect();
       }
 
       if track.interpolation.trim().is_empty() {
