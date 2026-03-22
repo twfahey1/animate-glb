@@ -252,6 +252,32 @@
   color: var(--soft-text);
 }
 
+.rig-profile-list {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 0;
+}
+
+.rig-profile-list div {
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.rig-profile-list div:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.rig-profile-list dt {
+  color: var(--muted-text);
+  font-size: 0.82rem;
+}
+
+.rig-profile-list dd {
+  margin: 6px 0 0;
+  color: var(--text-strong);
+}
+
 .token-list {
   display: flex;
   flex-wrap: wrap;

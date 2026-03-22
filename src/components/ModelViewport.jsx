@@ -1,8 +1,10 @@
-import { useEffect, useRef } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js'
 
 function disposeMaterial(material) {
   if (!material) {
@@ -33,19 +35,138 @@ function disposeObject(root) {
   })
 }
 
+function collectRenderStats(root) {
+  const stats = {
+    materialCount: 0,
+    meshCount: 0,
+    skinnedMeshCount: 0,
+    triangleCount: 0,
+    visibleMeshCount: 0,
+  }
+
+  root.updateMatrixWorld(true)
+  root.traverse((node) => {
+    if (!node.isMesh) {
+      return
+    }
+
+    stats.meshCount += 1
+
+    if (node.isSkinnedMesh) {
+      stats.skinnedMeshCount += 1
+    }
+
+    if (node.visible) {
+      stats.visibleMeshCount += 1
+    }
+
+    if (node.geometry?.index) {
+      stats.triangleCount += node.geometry.index.count / 3
+    } else if (node.geometry?.attributes?.position) {
+      stats.triangleCount += node.geometry.attributes.position.count / 3
+    }
+
+    if (Array.isArray(node.material)) {
+      stats.materialCount += node.material.length
+    } else if (node.material) {
+      stats.materialCount += 1
+    }
+  })
+
+  return stats
+}
+
+function normalizePreviewScale(object, box) {
+  const size = box.getSize(new THREE.Vector3())
+  const largestDimension = Math.max(size.x, size.y, size.z)
+
+  if (!Number.isFinite(largestDimension) || largestDimension <= 0) {
+    return {
+      normalized: false,
+      previewScale: object.scale.x,
+    }
+  }
+
+  let scaleFactor = 1
+
+  if (largestDimension < 0.05) {
+    scaleFactor = 1.8 / largestDimension
+  } else if (largestDimension > 12) {
+    scaleFactor = 7.5 / largestDimension
+  }
+
+  if (Math.abs(scaleFactor - 1) < 0.001) {
+    return {
+      normalized: false,
+      previewScale: object.scale.x,
+    }
+  }
+
+  object.scale.multiplyScalar(scaleFactor)
+  object.updateMatrixWorld(true)
+
+  return {
+    normalized: true,
+    previewScale: object.scale.x,
+  }
+}
+
 function frameObject(camera, controls, object) {
-  const box = new THREE.Box3().setFromObject(object)
+  object.updateMatrixWorld(true)
+  let box = new THREE.Box3().setFromObject(object)
+
+  if (box.isEmpty()) {
+    camera.position.set(1.8, 1.1, 2.6)
+    camera.near = 0.01
+    camera.far = 200
+    camera.updateProjectionMatrix()
+    controls.target.set(0, 0.75, 0)
+    controls.update()
+
+    return { centered: false, radius: 1 }
+  }
+
+  const scaleInfo = normalizePreviewScale(object, box)
+
+  if (scaleInfo.normalized) {
+    box = new THREE.Box3().setFromObject(object)
+  }
+
   const size = box.getSize(new THREE.Vector3())
   const center = box.getCenter(new THREE.Vector3())
-  const radius = Math.max(size.x, size.y, size.z, 1)
+
+  if (![size.x, size.y, size.z, center.x, center.y, center.z].every(Number.isFinite)) {
+    camera.position.set(1.8, 1.1, 2.6)
+    camera.near = 0.01
+    camera.far = 200
+    camera.updateProjectionMatrix()
+    controls.target.set(0, 0.75, 0)
+    controls.update()
+
+    return { centered: false, radius: 1 }
+  }
+
+  const maxSize = Math.max(size.x, size.y, size.z, 0.001)
+  const halfVerticalFov = THREE.MathUtils.degToRad(camera.fov * 0.5)
+  const fitHeightDistance = size.y > 0 ? size.y * 0.5 / Math.tan(halfVerticalFov) : 0
+  const fitWidthDistance = size.x > 0 ? size.x * 0.5 / (Math.tan(halfVerticalFov) * camera.aspect) : 0
+  const distance = Math.max(fitHeightDistance, fitWidthDistance, maxSize * 0.75, 0.12) * 1.35
+  const radius = Math.max(distance, maxSize)
 
   object.position.sub(center)
-  camera.position.set(radius * 1.5, radius * 0.9, radius * 1.9)
-  camera.near = 0.01
-  camera.far = radius * 20
+  camera.position.set(distance * 0.72, distance * 0.48, distance)
+  camera.near = Math.max(distance / 1000, 0.001)
+  camera.far = Math.max(distance * 40, 200)
   camera.updateProjectionMatrix()
-  controls.target.set(0, Math.max(size.y * 0.18, 0.2), 0)
+  controls.target.set(0, 0, 0)
   controls.update()
+
+  return {
+    centered: true,
+    normalized: scaleInfo.normalized,
+    previewScale: scaleInfo.previewScale,
+    radius,
+  }
 }
 
 function normalizeLookupKey(value) {
@@ -153,25 +274,118 @@ function makeClip(recipe, activeRoot) {
 function attachModel(runtime, gltf, onStatusChange, activeRootRef, embeddedAnimationsRef) {
   const root = gltf.scene || new THREE.Group()
   runtime.content.add(root)
-  frameObject(runtime.camera, runtime.controls, root)
+  const renderStats = collectRenderStats(root)
+  const framing = frameObject(runtime.camera, runtime.controls, root)
   activeRootRef.current = root
   embeddedAnimationsRef.current = gltf.animations
+
+  if (!renderStats.meshCount) {
+    onStatusChange(
+      'Model parsed, but no mesh objects were found. This file may contain only bones, empties, or unsupported data.',
+    )
+    return
+  }
+
+  if (!renderStats.visibleMeshCount) {
+    onStatusChange(
+      `Model parsed ${renderStats.meshCount} mesh objects, but none are currently visible. Check the source export for hidden meshes or disabled scene content.`,
+    )
+    return
+  }
+
+  if (!framing.centered) {
+    onStatusChange(
+      `Model parsed ${renderStats.visibleMeshCount} visible mesh objects, but the viewer could not compute stable bounds. This usually points to malformed geometry or extreme transforms in the GLB.`,
+    )
+    return
+  }
+
+  const loadPrefix = framing.normalized
+    ? `Model loaded with ${renderStats.visibleMeshCount} visible mesh objects. Preview scale normalized ${framing.previewScale.toFixed(2)}x for viewing.`
+    : `Model loaded with ${renderStats.visibleMeshCount} visible mesh objects.`
 
   if (gltf.animations.length) {
     const previewAction = runtime.mixer.clipAction(gltf.animations[0], root)
     previewAction.play()
-    onStatusChange('Model loaded. Playing the first embedded clip until you generate a new one.')
+    onStatusChange(`${loadPrefix} Playing the first embedded clip until you generate a new one.`)
     return
   }
 
-  onStatusChange('Model loaded. Generate an animation recipe to preview motion.')
+  onStatusChange(`${loadPrefix} Generate an animation recipe to preview motion.`)
 }
 
-function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStatusChange }) {
+function cloneSceneForPlayback(scene) {
+  return cloneSkeleton(scene)
+}
+
+function exportGlb(scene, animations) {
+  const exporter = new GLTFExporter()
+
+  return new Promise((resolve, reject) => {
+    exporter.parse(
+      scene,
+      (result) => {
+        if (result instanceof ArrayBuffer) {
+          resolve(result)
+          return
+        }
+
+        reject(new Error('GLB export returned JSON instead of a binary payload.'))
+      },
+      (error) => {
+        reject(error instanceof Error ? error : new Error('GLB export failed.'))
+      },
+      {
+        animations,
+        binary: true,
+        onlyVisible: false,
+      },
+    )
+  })
+}
+
+const ModelViewport = forwardRef(function ModelViewport(
+  { isTauriRuntime, modelFilePath, modelUrl, recipe, onStatusChange },
+  ref,
+) {
   const stageRef = useRef(null)
   const runtimeRef = useRef(null)
   const activeRootRef = useRef(null)
   const embeddedAnimationsRef = useRef([])
+  const sourceRootRef = useRef(null)
+  const sourceAnimationsRef = useRef([])
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      async exportRecipeGlb(activeRecipe) {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before exporting a GLB.')
+        }
+
+        if (!activeRecipe) {
+          throw new Error('Generate or select a recipe before exporting a GLB.')
+        }
+
+        const exportRoot = cloneSceneForPlayback(sourceRootRef.current)
+        const exportAnimations = sourceAnimationsRef.current.map((clip) => clip.clone())
+        const generatedClip = makeClip(activeRecipe, exportRoot)
+
+        if (!generatedClip) {
+          throw new Error('The selected recipe does not contain any playable tracks to export.')
+        }
+
+        exportAnimations.push(generatedClip)
+
+        const glbBuffer = await exportGlb(exportRoot, exportAnimations)
+        return {
+          bytes: Array.from(new Uint8Array(glbBuffer)),
+          defaultFileName: `${activeRecipe.name || 'generated-motion'}.glb`,
+        }
+      },
+    }),
+    [],
+  )
 
   useEffect(() => {
     const stage = stageRef.current
@@ -274,6 +488,8 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
       runtimeRef.current = null
       activeRootRef.current = null
       embeddedAnimationsRef.current = []
+      sourceRootRef.current = null
+      sourceAnimationsRef.current = []
     }
   }, [])
 
@@ -288,6 +504,8 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
     runtime.content.clear()
     activeRootRef.current = null
     embeddedAnimationsRef.current = []
+    sourceRootRef.current = null
+    sourceAnimationsRef.current = []
 
     if (!modelUrl && !modelFilePath) {
       onStatusChange('Choose a GLB to inspect and preview.')
@@ -311,7 +529,16 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
             '',
             (gltf) => {
               if (!cancelled) {
-                attachModel(runtime, gltf, onStatusChange, activeRootRef, embeddedAnimationsRef)
+                sourceRootRef.current = gltf.scene || new THREE.Group()
+                sourceAnimationsRef.current = gltf.animations.map((animation) => animation.clone())
+                const previewScene = cloneSceneForPlayback(sourceRootRef.current)
+                attachModel(
+                  runtime,
+                  { ...gltf, animations: sourceAnimationsRef.current.map((animation) => animation.clone()), scene: previewScene },
+                  onStatusChange,
+                  activeRootRef,
+                  embeddedAnimationsRef,
+                )
               }
             },
             () => {
@@ -347,7 +574,16 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
         if (cancelled) {
           return
         }
-        attachModel(runtime, gltf, onStatusChange, activeRootRef, embeddedAnimationsRef)
+        sourceRootRef.current = gltf.scene || new THREE.Group()
+        sourceAnimationsRef.current = gltf.animations.map((animation) => animation.clone())
+        const previewScene = cloneSceneForPlayback(sourceRootRef.current)
+        attachModel(
+          runtime,
+          { ...gltf, animations: sourceAnimationsRef.current.map((animation) => animation.clone()), scene: previewScene },
+          onStatusChange,
+          activeRootRef,
+          embeddedAnimationsRef,
+        )
       },
       undefined,
       () => {
@@ -368,6 +604,8 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
       runtime.content.clear()
       activeRootRef.current = null
       embeddedAnimationsRef.current = []
+      sourceRootRef.current = null
+      sourceAnimationsRef.current = []
     }
   }, [isTauriRuntime, modelFilePath, modelUrl, onStatusChange])
 
@@ -420,6 +658,6 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
       </div>
     </div>
   )
-}
+})
 
 export default ModelViewport

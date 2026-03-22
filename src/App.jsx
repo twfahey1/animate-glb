@@ -1,6 +1,6 @@
 import { startTransition, useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save as saveFileDialog } from '@tauri-apps/plugin-dialog'
 import ModelViewport from './components/ModelViewport.jsx'
 import './App.css'
 
@@ -68,6 +68,20 @@ function visibleItems(items, isExpanded, previewCount = 12) {
   }
 
   return isExpanded ? items : items.slice(0, previewCount)
+}
+
+function rigProfileEntries(rigProfile) {
+  if (!rigProfile) {
+    return []
+  }
+
+  return Object.entries(rigProfile).filter(([, value]) => Boolean(value))
+}
+
+function formatRigSlot(slotName) {
+  return slotName
+    .replace(/([A-Z])/g, ' $1')
+    .replace(/^./, (character) => character.toUpperCase())
 }
 
 function buildLocalRecipe(prompt) {
@@ -143,9 +157,24 @@ function formatSavedTime(epochMs) {
   })
 }
 
+function slugifyFileToken(value, fallback = 'generated-motion') {
+  const normalized = value
+    ?.toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return normalized || fallback
+}
+
+function buildExportFileName(fileName, recipeName) {
+  const baseName = fileName?.replace(/\.[^.]+$/, '') || 'model'
+  return `${slugifyFileToken(baseName, 'model')}-${slugifyFileToken(recipeName, 'generated-motion')}.glb`
+}
+
 function App() {
   const browserInputRef = useRef(null)
   const browserObjectUrlRef = useRef('')
+  const viewportRef = useRef(null)
   const isTauriRuntime = typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__ !== 'undefined'
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
   const [summary, setSummary] = useState(null)
@@ -162,6 +191,7 @@ function App() {
   const [isGeneratingRecipe, setIsGeneratingRecipe] = useState(false)
   const [isLoadingSavedClips, setIsLoadingSavedClips] = useState(false)
   const [isSavingClip, setIsSavingClip] = useState(false)
+  const [isExportingGlb, setIsExportingGlb] = useState(false)
 
   useEffect(() => {
     return () => {
@@ -349,6 +379,57 @@ function App() {
     }
   }
 
+  async function handleExportGlb() {
+    if (!summary || !recipe || !viewportRef.current) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsExportingGlb(true)
+
+    try {
+      const exportPayload = await viewportRef.current.exportRecipeGlb(recipe)
+      const suggestedName = buildExportFileName(summary.fileName, recipe.name || exportPayload.defaultFileName)
+
+      if (!isTauriRuntime) {
+        const blob = new Blob([Uint8Array.from(exportPayload.bytes)], { type: 'model/gltf-binary' })
+        const downloadUrl = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = downloadUrl
+        link.download = suggestedName
+        link.click()
+        URL.revokeObjectURL(downloadUrl)
+        setViewerStatus(`Downloaded ${suggestedName}.`)
+        return
+      }
+
+      const targetPath = await saveFileDialog({
+        defaultPath: suggestedName,
+        filters: [
+          {
+            name: 'GLB model',
+            extensions: ['glb'],
+          },
+        ],
+      })
+
+      if (!targetPath || Array.isArray(targetPath)) {
+        return
+      }
+
+      await invoke('write_binary_file', {
+        filePath: targetPath,
+        bytes: exportPayload.bytes,
+      })
+
+      setViewerStatus(`Exported ${recipe.name} to ${targetPath}.`)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to export the current GLB.')
+    } finally {
+      setIsExportingGlb(false)
+    }
+  }
+
   function handlePlaySavedClip(savedClip) {
     startTransition(() => {
       setActiveSavedClipId(savedClip.id)
@@ -406,6 +487,7 @@ function App() {
           </div>
 
           <ModelViewport
+            ref={viewportRef}
             isTauriRuntime={isTauriRuntime}
             modelFilePath={viewerFilePath}
             modelUrl={viewerUrl}
@@ -530,6 +612,29 @@ function App() {
                 </p>
               )}
             </div>
+
+            <div className="metadata-expanded-card">
+              <div className="metadata-expanded-header">
+                <div>
+                  <p className="label">Rig map</p>
+                  <h3>Canonical joint profile</h3>
+                </div>
+              </div>
+              {rigProfileEntries(summary?.rigProfile).length ? (
+                <dl className="rig-profile-list">
+                  {rigProfileEntries(summary?.rigProfile).map(([slotName, nodeName]) => (
+                    <div key={slotName}>
+                      <dt>{formatRigSlot(slotName)}</dt>
+                      <dd>{nodeName}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : (
+                <p className="metadata-note">
+                  No canonical rig profile could be inferred from the currently captured node names.
+                </p>
+              )}
+            </div>
           </section>
 
           <section className="panel prompt-panel">
@@ -602,10 +707,18 @@ function App() {
                 >
                   {isSavingClip ? 'Saving…' : 'Save'}
                 </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleExportGlb}
+                  disabled={!summary || !recipe || isExportingGlb}
+                >
+                  {isExportingGlb ? 'Saving GLB…' : 'Save GLB with animations'}
+                </button>
                 <span className="clip-actions-note">
                   {activeSavedClipId
                     ? 'Saved clip selected for playback.'
-                    : 'Save this result to replay it later for the current model.'}
+                    : 'Save this result locally or export a new GLB with the generated clip embedded as a native animation for other tools.'}
                 </span>
               </div>
 

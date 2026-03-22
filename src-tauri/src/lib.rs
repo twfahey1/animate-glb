@@ -18,7 +18,34 @@ struct GlbSummary {
   scene_names: Vec<String>,
   node_names: Vec<String>,
   target_node_names: Vec<String>,
+  rig_profile: RigProfile,
   animation_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RigProfile {
+  root: Option<String>,
+  pelvis: Option<String>,
+  spine: Option<String>,
+  chest: Option<String>,
+  neck: Option<String>,
+  head: Option<String>,
+  jaw: Option<String>,
+  left_shoulder: Option<String>,
+  left_upper_arm: Option<String>,
+  left_forearm: Option<String>,
+  left_hand: Option<String>,
+  right_shoulder: Option<String>,
+  right_upper_arm: Option<String>,
+  right_forearm: Option<String>,
+  right_hand: Option<String>,
+  left_thigh: Option<String>,
+  left_calf: Option<String>,
+  left_foot: Option<String>,
+  right_thigh: Option<String>,
+  right_calf: Option<String>,
+  right_foot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +143,23 @@ fn write_saved_animation_clips(
   fs::write(file_path, content).map_err(|error| format!("Unable to write saved clips: {error}"))
 }
 
+#[tauri::command]
+fn write_binary_file(file_path: String, bytes: Vec<u8>) -> Result<(), String> {
+  let target_path = PathBuf::from(file_path.clone());
+
+  if bytes.is_empty() {
+    return Err("No export bytes were provided.".to_string());
+  }
+
+  if let Some(parent) = target_path.parent() {
+    fs::create_dir_all(parent)
+      .map_err(|error| format!("Unable to create the destination directory: {error}"))?;
+  }
+
+  fs::write(&target_path, bytes)
+    .map_err(|error| format!("Unable to write the exported file to {}: {error}", target_path.to_string_lossy()))
+}
+
 fn sampled_curve(points: &[(f32, f32)]) -> (Vec<f32>, Vec<f32>) {
   let mut times = Vec::with_capacity(points.len());
   let mut values = Vec::with_capacity(points.len());
@@ -146,6 +190,63 @@ fn normalize_lookup_key(value: &str) -> String {
     .filter(|character| character.is_ascii_alphanumeric())
     .flat_map(|character| character.to_lowercase())
     .collect()
+}
+
+fn find_profile_node(candidates: &[String], keywords: &[&str]) -> Option<String> {
+  let normalized_candidates = candidates
+    .iter()
+    .map(|candidate| (normalize_lookup_key(candidate), candidate.clone()))
+    .collect::<Vec<_>>();
+
+  for keyword in keywords {
+    let normalized_keyword = normalize_lookup_key(keyword);
+
+    if let Some((_, candidate)) = normalized_candidates
+      .iter()
+      .find(|(candidate_key, _)| candidate_key == &normalized_keyword)
+    {
+      return Some(candidate.clone());
+    }
+  }
+
+  for keyword in keywords {
+    let normalized_keyword = normalize_lookup_key(keyword);
+
+    if let Some((_, candidate)) = normalized_candidates
+      .iter()
+      .find(|(candidate_key, _)| candidate_key.contains(&normalized_keyword))
+    {
+      return Some(candidate.clone());
+    }
+  }
+
+  None
+}
+
+fn build_rig_profile(node_names: &[String]) -> RigProfile {
+  RigProfile {
+    root: find_profile_node(node_names, &["root", "armature", "origin"]),
+    pelvis: find_profile_node(node_names, &["hips", "pelvis", "hip"]),
+    spine: find_profile_node(node_names, &["spine", "spine1", "spine01"]),
+    chest: find_profile_node(node_names, &["chest", "spine2", "spine02", "upperchest"]),
+    neck: find_profile_node(node_names, &["neck", "neck1"]),
+    head: find_profile_node(node_names, &["head", "headtop"]),
+    jaw: find_profile_node(node_names, &["jaw", "chin", "mouth"]),
+    left_shoulder: find_profile_node(node_names, &["leftshoulder", "shoulderl", "lshoulder", "claviclel"]),
+    left_upper_arm: find_profile_node(node_names, &["leftarm", "leftupperarm", "upperarml", "arml", "larm"]),
+    left_forearm: find_profile_node(node_names, &["leftforearm", "leftlowerarm", "forearml", "lowerarml", "lforearm"]),
+    left_hand: find_profile_node(node_names, &["lefthand", "handl", "lhand"]),
+    right_shoulder: find_profile_node(node_names, &["rightshoulder", "shoulderr", "rshoulder", "clavicler"]),
+    right_upper_arm: find_profile_node(node_names, &["rightarm", "rightupperarm", "upperarmr", "armr", "rarm"]),
+    right_forearm: find_profile_node(node_names, &["rightforearm", "rightlowerarm", "forearmr", "lowerarmr", "rforearm"]),
+    right_hand: find_profile_node(node_names, &["righthand", "handr", "rhand"]),
+    left_thigh: find_profile_node(node_names, &["leftupleg", "leftthigh", "uplegl", "thighl", "lthigh"]),
+    left_calf: find_profile_node(node_names, &["leftleg", "leftcalf", "legl", "calfl", "lcalf"]),
+    left_foot: find_profile_node(node_names, &["leftfoot", "footl", "lfoot"]),
+    right_thigh: find_profile_node(node_names, &["rightupleg", "rightthigh", "uplegr", "thighr", "rthigh"]),
+    right_calf: find_profile_node(node_names, &["rightleg", "rightcalf", "legr", "calfr", "rcalf"]),
+    right_foot: find_profile_node(node_names, &["rightfoot", "footr", "rfoot"]),
+  }
 }
 
 fn find_matching_target_name(requested_name: &str, summary: &GlbSummary) -> Option<String> {
@@ -218,23 +319,55 @@ fn pick_target(summary: &GlbSummary, keywords: &[&str]) -> Option<String> {
 }
 
 fn primary_body_target(summary: &GlbSummary) -> Option<String> {
-  pick_target(summary, &["hips", "pelvis", "root", "spine", "chest"])
+  summary
+    .rig_profile
+    .pelvis
+    .clone()
+    .or_else(|| summary.rig_profile.root.clone())
+    .or_else(|| summary.rig_profile.spine.clone())
+    .or_else(|| summary.rig_profile.chest.clone())
+    .or_else(|| pick_target(summary, &["hips", "pelvis", "root", "spine", "chest"]))
 }
 
 fn head_target(summary: &GlbSummary) -> Option<String> {
-  pick_target(summary, &["head", "neck", "jaw"])
+  summary
+    .rig_profile
+    .head
+    .clone()
+    .or_else(|| summary.rig_profile.neck.clone())
+    .or_else(|| summary.rig_profile.jaw.clone())
+    .or_else(|| pick_target(summary, &["head", "neck", "jaw"]))
 }
 
 fn chest_target(summary: &GlbSummary) -> Option<String> {
-  pick_target(summary, &["chest", "spine2", "spine1", "spine", "upperchest"])
+  summary
+    .rig_profile
+    .chest
+    .clone()
+    .or_else(|| summary.rig_profile.spine.clone())
+    .or_else(|| pick_target(summary, &["chest", "spine2", "spine1", "spine", "upperchest"]))
 }
 
 fn right_arm_target(summary: &GlbSummary) -> Option<String> {
-  pick_target(summary, &["righthand", "rightforearm", "rightlowerarm", "rightarm", "hand_r", "arm_r"])
+  summary
+    .rig_profile
+    .right_hand
+    .clone()
+    .or_else(|| summary.rig_profile.right_forearm.clone())
+    .or_else(|| summary.rig_profile.right_upper_arm.clone())
+    .or_else(|| summary.rig_profile.right_shoulder.clone())
+    .or_else(|| pick_target(summary, &["righthand", "rightforearm", "rightlowerarm", "rightarm", "hand_r", "arm_r"]))
 }
 
 fn left_arm_target(summary: &GlbSummary) -> Option<String> {
-  pick_target(summary, &["lefthand", "leftforearm", "leftlowerarm", "leftarm", "hand_l", "arm_l"])
+  summary
+    .rig_profile
+    .left_hand
+    .clone()
+    .or_else(|| summary.rig_profile.left_forearm.clone())
+    .or_else(|| summary.rig_profile.left_upper_arm.clone())
+    .or_else(|| summary.rig_profile.left_shoulder.clone())
+    .or_else(|| pick_target(summary, &["lefthand", "leftforearm", "leftlowerarm", "leftarm", "hand_l", "arm_l"]))
 }
 
 fn normalize_binding(binding: &str) -> Option<String> {
@@ -645,6 +778,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     })
     .take(96)
     .collect::<Vec<_>>();
+  let rig_profile = build_rig_profile(&node_names);
   let animation_names = document
     .animations()
     .enumerate()
@@ -670,6 +804,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     scene_names,
     node_names,
     target_node_names,
+    rig_profile,
     animation_names,
   })
 }
@@ -774,7 +909,8 @@ pub fn run() {
       read_glb_binary,
       generate_animation_recipe,
       list_saved_animation_clips,
-      save_animation_clip
+      save_animation_clip,
+      write_binary_file
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
