@@ -24,6 +24,10 @@ function sourceLabel(source) {
     return 'OpenAI recipe'
   }
 
+  if (source === 'openai-fallback') {
+    return 'OpenAI fallback recipe'
+  }
+
   if (source === 'browser') {
     return 'Browser fallback recipe'
   }
@@ -416,8 +420,8 @@ function App() {
 
               <ul className="track-list">
                 {(recipe?.tracks ?? []).map((track) => (
-                  <li key={`${track.binding}-${track.times.join('-')}`}>
-                    <span>{track.binding}</span>
+                  <li key={`${track.targetName ?? 'root'}-${track.binding}-${track.times.join('-')}`}>
+                    <span>{track.targetName ? `${track.targetName} ${track.binding}` : `Root ${track.binding}`}</span>
                     <strong>{track.times.length} keyframes</strong>
                   </li>
                 ))}

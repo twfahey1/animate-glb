@@ -15,12 +15,14 @@ struct GlbSummary {
   animation_count: usize,
   scene_names: Vec<String>,
   node_names: Vec<String>,
+  target_node_names: Vec<String>,
   animation_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AnimationTrack {
+  target_name: Option<String>,
   binding: String,
   times: Vec<f32>,
   values: Vec<f32>,
@@ -64,15 +66,113 @@ fn sampled_curve(points: &[(f32, f32)]) -> (Vec<f32>, Vec<f32>) {
   (times, values)
 }
 
-fn track(binding: &str, points: &[(f32, f32)]) -> AnimationTrack {
+fn targeted_track(target_name: Option<String>, binding: &str, points: &[(f32, f32)]) -> AnimationTrack {
   let (times, values) = sampled_curve(points);
 
   AnimationTrack {
+    target_name,
     binding: binding.to_string(),
     times,
     values,
     interpolation: "smooth".to_string(),
   }
+}
+
+fn normalize_lookup_key(value: &str) -> String {
+  value
+    .chars()
+    .filter(|character| character.is_ascii_alphanumeric())
+    .flat_map(|character| character.to_lowercase())
+    .collect()
+}
+
+fn find_matching_target_name(requested_name: &str, summary: &GlbSummary) -> Option<String> {
+  if requested_name.trim().is_empty() {
+    return None;
+  }
+
+  let candidates = if summary.target_node_names.is_empty() {
+    &summary.node_names
+  } else {
+    &summary.target_node_names
+  };
+
+  let exact = candidates
+    .iter()
+    .find(|candidate| candidate.eq_ignore_ascii_case(requested_name))
+    .cloned();
+
+  if exact.is_some() {
+    return exact;
+  }
+
+  let requested_key = normalize_lookup_key(requested_name);
+
+  if requested_key.is_empty() {
+    return None;
+  }
+
+  if let Some(candidate) = candidates
+    .iter()
+    .find(|candidate| normalize_lookup_key(candidate) == requested_key)
+    .cloned()
+  {
+    return Some(candidate);
+  }
+
+  candidates
+    .iter()
+    .filter_map(|candidate| {
+      let candidate_key = normalize_lookup_key(candidate);
+      if candidate_key.contains(&requested_key) || requested_key.contains(&candidate_key) {
+        return Some((candidate_key.len(), candidate.clone()));
+      }
+      None
+    })
+    .min_by_key(|(length, _)| *length)
+    .map(|(_, candidate)| candidate)
+}
+
+fn pick_target(summary: &GlbSummary, keywords: &[&str]) -> Option<String> {
+  let candidates = if summary.target_node_names.is_empty() {
+    &summary.node_names
+  } else {
+    &summary.target_node_names
+  };
+
+  for keyword in keywords {
+    let keyword_key = normalize_lookup_key(keyword);
+
+    if let Some(candidate) = candidates
+      .iter()
+      .find(|candidate| normalize_lookup_key(candidate).contains(&keyword_key))
+      .cloned()
+    {
+      return Some(candidate);
+    }
+  }
+
+  None
+}
+
+fn primary_body_target(summary: &GlbSummary) -> Option<String> {
+  pick_target(summary, &["hips", "pelvis", "root", "spine", "chest"])
+}
+
+fn head_target(summary: &GlbSummary) -> Option<String> {
+  pick_target(summary, &["head", "neck", "jaw"])
+}
+
+fn chest_target(summary: &GlbSummary) -> Option<String> {
+  pick_target(summary, &["chest", "spine2", "spine1", "spine", "upperchest"])
+}
+
+fn right_arm_target(summary: &GlbSummary) -> Option<String> {
+  pick_target(summary, &["righthand", "rightforearm", "rightlowerarm", "rightarm", "hand_r", "arm_r"])
+}
+
+fn left_arm_target(summary: &GlbSummary) -> Option<String> {
+  pick_target(summary, &["lefthand", "leftforearm", "leftlowerarm", "leftarm", "hand_l", "arm_l"])
 }
 
 fn normalize_binding(binding: &str) -> Option<String> {
@@ -124,7 +224,7 @@ fn normalize_binding(binding: &str) -> Option<String> {
   None
 }
 
-fn fallback_recipe(prompt: &str) -> AnimationRecipe {
+fn fallback_recipe(prompt: &str, summary: &GlbSummary) -> AnimationRecipe {
   let normalized = prompt.to_lowercase();
   let duration_seconds = if normalized.contains("slow") {
     6.0
@@ -133,9 +233,14 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
   } else {
     4.0
   };
+  let torso_target = chest_target(summary).or_else(|| primary_body_target(summary));
+  let head_target = head_target(summary);
+  let right_arm_target = right_arm_target(summary);
+  let left_arm_target = left_arm_target(summary);
 
   let mut tracks = vec![
-    track(
+    targeted_track(
+      torso_target.clone(),
       ".position[y]",
       &[
         (0.0, 0.0),
@@ -145,15 +250,18 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
         (duration_seconds, 0.0),
       ],
     ),
-    track(
+    targeted_track(
+      torso_target.clone(),
       ".scale[x]",
       &[(0.0, 1.0), (duration_seconds * 0.5, 1.02), (duration_seconds, 1.0)],
     ),
-    track(
+    targeted_track(
+      torso_target.clone(),
       ".scale[y]",
       &[(0.0, 1.0), (duration_seconds * 0.5, 1.03), (duration_seconds, 1.0)],
     ),
-    track(
+    targeted_track(
+      torso_target.clone(),
       ".scale[z]",
       &[(0.0, 1.0), (duration_seconds * 0.5, 1.02), (duration_seconds, 1.0)],
     ),
@@ -162,19 +270,21 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
   let mut rationale = "Generated a calm idle loop with subtle breathing and lift.".to_string();
 
   if normalized.contains("turn") || normalized.contains("spin") || normalized.contains("rotate") {
-    tracks.push(track(
+    tracks.push(targeted_track(
+      head_target.clone().or_else(|| torso_target.clone()),
       ".rotation[y]",
       &[
         (0.0, 0.0),
-        (duration_seconds * 0.5, std::f32::consts::PI * 0.5),
-        (duration_seconds, std::f32::consts::PI),
+        (duration_seconds * 0.5, std::f32::consts::PI * 0.18),
+        (duration_seconds, std::f32::consts::PI * 0.3),
       ],
     ));
-    rationale = "Added a loopable turn layered on top of an idle breathing motion.".to_string();
+    rationale = "Added a head- or upper-body turn layered on top of an idle breathing motion.".to_string();
   }
 
   if normalized.contains("bounce") || normalized.contains("hop") || normalized.contains("jump") {
-    tracks.push(track(
+    tracks.push(targeted_track(
+      primary_body_target(summary),
       ".position[y]",
       &[
         (0.0, 0.0),
@@ -188,7 +298,8 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
   }
 
   if normalized.contains("sway") || normalized.contains("dance") || normalized.contains("groove") {
-    tracks.push(track(
+    tracks.push(targeted_track(
+      torso_target.clone(),
       ".rotation[z]",
       &[
         (0.0, 0.0),
@@ -198,7 +309,8 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
         (duration_seconds, 0.0),
       ],
     ));
-    tracks.push(track(
+    tracks.push(targeted_track(
+      torso_target.clone(),
       ".position[x]",
       &[
         (0.0, 0.0),
@@ -212,7 +324,8 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
   }
 
   if normalized.contains("nod") || normalized.contains("look down") || normalized.contains("bow") {
-    tracks.push(track(
+    tracks.push(targeted_track(
+      head_target.clone().or_else(|| torso_target.clone()),
       ".rotation[x]",
       &[
         (0.0, 0.0),
@@ -222,6 +335,63 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
       ],
     ));
     rationale = "Added a head-and-torso nod profile with a soft return to neutral.".to_string();
+  }
+
+  if normalized.contains("look left") || normalized.contains("glance left") {
+    tracks.push(targeted_track(
+      head_target.clone().or_else(|| torso_target.clone()),
+      ".rotation[y]",
+      &[(0.0, 0.0), (duration_seconds * 0.45, 0.18), (duration_seconds, 0.0)],
+    ));
+  }
+
+  if normalized.contains("look right") || normalized.contains("glance right") {
+    tracks.push(targeted_track(
+      head_target.clone().or_else(|| torso_target.clone()),
+      ".rotation[y]",
+      &[(0.0, 0.0), (duration_seconds * 0.45, -0.18), (duration_seconds, 0.0)],
+    ));
+  }
+
+  if normalized.contains("laugh") || normalized.contains("chuckle") {
+    tracks.push(targeted_track(
+      head_target.clone().or_else(|| torso_target.clone()),
+      ".rotation[z]",
+      &[
+        (0.0, 0.0),
+        (duration_seconds * 0.18, 0.08),
+        (duration_seconds * 0.36, -0.05),
+        (duration_seconds * 0.54, 0.06),
+        (duration_seconds, 0.0),
+      ],
+    ));
+    tracks.push(targeted_track(
+      torso_target.clone(),
+      ".position[y]",
+      &[
+        (0.0, 0.0),
+        (duration_seconds * 0.22, 0.04),
+        (duration_seconds * 0.44, 0.0),
+        (duration_seconds * 0.66, 0.03),
+        (duration_seconds, 0.0),
+      ],
+    ));
+    rationale = "Added a small laugh bob through the upper torso and head to support the prompt.".to_string();
+  }
+
+  if normalized.contains("point") {
+    let pointing_arm = if normalized.contains("left") {
+      left_arm_target.clone().or_else(|| right_arm_target.clone())
+    } else {
+      right_arm_target.clone().or_else(|| left_arm_target.clone())
+    };
+
+    tracks.push(targeted_track(
+      pointing_arm,
+      ".rotation[z]",
+      &[(0.0, 0.0), (duration_seconds * 0.35, -0.65), (duration_seconds, -0.55)],
+    ));
+    rationale = "Raised an arm target and combined it with upper-body motion to approximate a pointing pose.".to_string();
   }
 
   AnimationRecipe {
@@ -234,13 +404,17 @@ fn fallback_recipe(prompt: &str) -> AnimationRecipe {
   }
 }
 
-fn sanitize_recipe(mut recipe: AnimationRecipe) -> AnimationRecipe {
+fn sanitize_recipe(mut recipe: AnimationRecipe, summary: &GlbSummary) -> AnimationRecipe {
   recipe.duration_seconds = recipe.duration_seconds.clamp(0.5, 12.0);
   recipe.tracks = recipe
     .tracks
     .into_iter()
     .filter_map(|mut track| {
       track.binding = normalize_binding(&track.binding)?;
+      track.target_name = track
+        .target_name
+        .as_deref()
+        .and_then(|requested_name| find_matching_target_name(requested_name, summary));
 
       if track.times.is_empty() || track.times.len() != track.values.len() {
         return None;
@@ -284,13 +458,14 @@ async fn openai_recipe(prompt: &str, summary: &GlbSummary) -> Result<Option<Anim
     "messages": [
       {
         "role": "system",
-        "content": "You generate concise loop-friendly animation recipes for 3D models. Return JSON only. Use only these bindings: .position[x], .position[y], .position[z], .rotation[x], .rotation[y], .rotation[z], .scale[x], .scale[y], .scale[z]. Times and values arrays must be equal length."
+        "content": "You generate concise loop-friendly animation recipes for 3D models. Return JSON only. Use only these bindings: .position[x], .position[y], .position[z], .rotation[x], .rotation[y], .rotation[z], .scale[x], .scale[y], .scale[z]. Each track may include an optional targetName using an exact node or bone name from the provided candidate list. Omit targetName to animate the root. Times and values arrays must be equal length. Prefer head, neck, chest, spine, shoulder, arm, forearm, hand, hips, pelvis, or jaw targets when the prompt implies local body motion."
       },
       {
         "role": "user",
         "content": format!(
-          "Prompt: {prompt}\n\nModel summary: {}\n\nReturn an object with keys name, source, rationale, durationSeconds, looping, tracks. Each track must include binding, times, values, interpolation. Keep duration under 12 seconds.",
+          "Prompt: {prompt}\n\nModel summary: {}\n\nCandidate target node names: {}\n\nReturn an object with keys name, source, rationale, durationSeconds, looping, tracks. Each track must include binding, times, values, interpolation, and may include targetName. Keep duration under 12 seconds and use the exact targetName strings provided above when choosing local body motion.",
           serde_json::to_string(summary).map_err(|error| error.to_string())?
+          , serde_json::to_string(&summary.target_node_names).map_err(|error| error.to_string())?
         )
       }
     ]
@@ -324,10 +499,10 @@ async fn openai_recipe(prompt: &str, summary: &GlbSummary) -> Result<Option<Anim
     .map_err(|error| format!("OpenAI returned invalid JSON for an animation recipe: {error}"))?;
   recipe.source = "openai".to_string();
 
-  let sanitized = sanitize_recipe(recipe);
+  let sanitized = sanitize_recipe(recipe, summary);
 
   if sanitized.tracks.is_empty() {
-    let mut fallback = fallback_recipe(prompt);
+    let mut fallback = fallback_recipe(prompt, summary);
     fallback.source = "openai-fallback".to_string();
     fallback.rationale = "OpenAI returned a recipe, but its track bindings could not be mapped into the current viewer. Applied a local playable fallback instead.".to_string();
     return Ok(Some(fallback));
@@ -367,9 +542,23 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     .filter_map(|(index, node)| {
       node.name()
         .map(str::to_string)
-        .or_else(|| (index < 12).then(|| format!("Node {}", index + 1)))
+        .or_else(|| (index < 24).then(|| format!("Node {}", index + 1)))
     })
-    .take(16)
+    .take(64)
+    .collect::<Vec<_>>();
+  let target_node_names = document
+    .nodes()
+    .filter_map(|node| node.name().map(str::to_string))
+    .filter(|name| {
+      let key = normalize_lookup_key(name);
+      [
+        "head", "neck", "jaw", "spine", "chest", "hip", "pelvis", "root", "shoulder", "arm",
+        "forearm", "hand", "finger", "leg", "foot", "toe"
+      ]
+      .iter()
+      .any(|keyword| key.contains(keyword))
+    })
+    .take(96)
     .collect::<Vec<_>>();
   let animation_names = document
     .animations()
@@ -395,6 +584,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     animation_count: animation_names.len(),
     scene_names,
     node_names,
+    target_node_names,
     animation_names,
   })
 }
@@ -434,10 +624,10 @@ async fn generate_animation_recipe(input: GenerateAnimationInput) -> Result<Anim
 
   match openai_recipe(&input.prompt, &input.summary).await {
     Ok(Some(recipe)) => Ok(recipe),
-    Ok(None) => Ok(fallback_recipe(&input.prompt)),
+    Ok(None) => Ok(fallback_recipe(&input.prompt, &input.summary)),
     Err(error) => {
       log::warn!("OpenAI animation generation failed, using fallback recipe: {error}");
-      Ok(fallback_recipe(&input.prompt))
+      Ok(fallback_recipe(&input.prompt, &input.summary))
     }
   }
 }

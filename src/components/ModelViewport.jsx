@@ -48,20 +48,69 @@ function frameObject(camera, controls, object) {
   controls.update()
 }
 
-function makeClip(recipe) {
+function normalizeLookupKey(value) {
+  return value.replace(/[^a-z0-9]/gi, '').toLowerCase()
+}
+
+function findTargetObject(root, targetName) {
+  if (!targetName) {
+    return root
+  }
+
+  const exactMatch = root.getObjectByName(targetName)
+
+  if (exactMatch) {
+    return exactMatch
+  }
+
+  const requestedKey = normalizeLookupKey(targetName)
+
+  if (!requestedKey) {
+    return null
+  }
+
+  let fallbackMatch = null
+
+  root.traverse((node) => {
+    if (fallbackMatch || !node.name) {
+      return
+    }
+
+    const candidateKey = normalizeLookupKey(node.name)
+
+    if (candidateKey === requestedKey || candidateKey.includes(requestedKey) || requestedKey.includes(candidateKey)) {
+      fallbackMatch = node
+    }
+  })
+
+  return fallbackMatch
+}
+
+function makeClip(recipe, activeRoot) {
   if (!recipe?.tracks?.length) {
     return null
   }
 
-  const tracks = recipe.tracks.map(
-    (track) =>
-      new THREE.NumberKeyframeTrack(
-        track.binding,
+  const tracks = recipe.tracks
+    .map((track) => {
+      const targetObject = findTargetObject(activeRoot, track.targetName)
+
+      if (!targetObject) {
+        return null
+      }
+
+      return new THREE.NumberKeyframeTrack(
+        `${targetObject.uuid}${track.binding}`,
         Float32Array.from(track.times),
         Float32Array.from(track.values),
         track.interpolation === 'linear' ? THREE.InterpolateLinear : THREE.InterpolateSmooth,
-      ),
-  )
+      )
+    })
+    .filter(Boolean)
+
+  if (!tracks.length) {
+    return null
+  }
 
   return new THREE.AnimationClip(recipe.name, recipe.durationSeconds, tracks)
 }
@@ -307,7 +356,7 @@ function ModelViewport({ isTauriRuntime, modelFilePath, modelUrl, recipe, onStat
       return undefined
     }
 
-    const clip = makeClip(recipe)
+    const clip = makeClip(recipe, activeRoot)
 
     if (!clip) {
       onStatusChange('The recipe did not contain any playable animation tracks.')

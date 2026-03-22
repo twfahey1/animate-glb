@@ -8,6 +8,7 @@ Desktop MVP for loading a GLB or GLTF file, previewing it in Three.js, and gener
 - Rust command to inspect a model and extract scene, node, and animation metadata
 - Three.js viewport with camera framing, orbit controls, and embedded-animation preview
 - Prompt form that asks the backend for a generated animation recipe
+- Node- and bone-targeted playback for prompts that imply local body motion like head turns, laughs, and pointing
 - Optional OpenAI-backed recipe generation when `OPENAI_API_KEY` is present
 - Deterministic local fallback recipe generator when no AI credentials are configured
 
@@ -44,7 +45,7 @@ If the OpenAI request fails or those variables are absent, the backend automatic
 
 ## Next implementation targets
 
-- Map generated motion onto specific nodes or skeleton bones instead of just root transforms
+- Improve targeting quality with per-model retargeting profiles and better side detection for limbs
 - Add prompt history and recipe persistence
 - Import and export generated clips in a reusable format
-- Add tests around prompt parsing and GLB metadata extraction
+- Add tests around prompt parsing, target matching, and GLB metadata extraction
