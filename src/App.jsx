@@ -57,8 +57,17 @@ function buildBrowserSummary(file) {
     animationCount: 0,
     sceneNames: [],
     nodeNames: [],
+    targetNodeNames: [],
     animationNames: [],
   }
+}
+
+function visibleItems(items, isExpanded, previewCount = 12) {
+  if (!items?.length) {
+    return []
+  }
+
+  return isExpanded ? items : items.slice(0, previewCount)
 }
 
 function buildLocalRecipe(prompt) {
@@ -147,6 +156,8 @@ function App() {
   const [activeSavedClipId, setActiveSavedClipId] = useState('')
   const [viewerStatus, setViewerStatus] = useState('Choose a GLB to inspect and preview.')
   const [errorMessage, setErrorMessage] = useState('')
+  const [showAllNodes, setShowAllNodes] = useState(false)
+  const [showAllTargetNodes, setShowAllTargetNodes] = useState(false)
   const [isPickingModel, setIsPickingModel] = useState(false)
   const [isGeneratingRecipe, setIsGeneratingRecipe] = useState(false)
   const [isLoadingSavedClips, setIsLoadingSavedClips] = useState(false)
@@ -209,6 +220,8 @@ function App() {
       setViewerUrl(objectUrl)
       setViewerFilePath('')
       setActiveSavedClipId('')
+      setShowAllNodes(false)
+      setShowAllTargetNodes(false)
       setRecipe(null)
     })
   }
@@ -252,6 +265,8 @@ function App() {
         setViewerUrl('')
         setViewerFilePath(nextSummary.filePath)
         setActiveSavedClipId('')
+        setShowAllNodes(false)
+        setShowAllTargetNodes(false)
         setRecipe(null)
       })
     } catch (error) {
@@ -446,6 +461,75 @@ function App() {
                 <dd>{listPreview(summary?.animationNames, 'No embedded animations')}</dd>
               </div>
             </dl>
+
+            <div className="metadata-expanded-card">
+              <div className="metadata-expanded-header">
+                <div>
+                  <p className="label">Hierarchy</p>
+                  <h3>All discovered nodes</h3>
+                </div>
+                <button
+                  className="secondary-button metadata-toggle"
+                  type="button"
+                  onClick={() => setShowAllNodes((currentValue) => !currentValue)}
+                  disabled={!summary?.nodeNames?.length}
+                >
+                  {showAllNodes ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+              {summary?.nodeNames?.length ? (
+                <>
+                  <p className="metadata-note">
+                    Showing {visibleItems(summary.nodeNames, showAllNodes).length} of {summary.nodeNames.length}{' '}
+                    collected node names. The numeric node stat above is the full parsed node count.
+                  </p>
+                  <div className="token-list">
+                    {visibleItems(summary.nodeNames, showAllNodes).map((nodeName) => (
+                      <span className="token-chip" key={nodeName}>
+                        {nodeName}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <p className="metadata-note">No named nodes were captured for this model.</p>
+              )}
+            </div>
+
+            <div className="metadata-expanded-card">
+              <div className="metadata-expanded-header">
+                <div>
+                  <p className="label">Targeting</p>
+                  <h3>Prompt-targetable bones and nodes</h3>
+                </div>
+                <button
+                  className="secondary-button metadata-toggle"
+                  type="button"
+                  onClick={() => setShowAllTargetNodes((currentValue) => !currentValue)}
+                  disabled={!summary?.targetNodeNames?.length}
+                >
+                  {showAllTargetNodes ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+              {summary?.targetNodeNames?.length ? (
+                <>
+                  <p className="metadata-note">
+                    These are the named nodes the prompt system currently considers for local body motion.
+                  </p>
+                  <div className="token-list">
+                    {visibleItems(summary.targetNodeNames, showAllTargetNodes).map((nodeName) => (
+                      <span className="token-chip token-chip-target" key={nodeName}>
+                        {nodeName}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <p className="metadata-note">
+                  No targetable named bones or nodes were detected for this model yet.
+                </p>
+              )}
+            </div>
           </section>
 
           <section className="panel prompt-panel">

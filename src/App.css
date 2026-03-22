@@ -222,6 +222,54 @@
   color: var(--soft-text);
 }
 
+.metadata-expanded-card {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.metadata-expanded-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.metadata-toggle {
+  padding: 0.65rem 1rem;
+}
+
+.metadata-note {
+  margin-top: 10px;
+  color: var(--soft-text);
+}
+
+.token-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.token-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-strong);
+  font-size: 0.92rem;
+}
+
+.token-chip-target {
+  border-color: rgba(255, 178, 97, 0.32);
+  background: rgba(255, 178, 97, 0.08);
+}
+
 .prompt-form {
   display: grid;
   gap: 12px;
@@ -381,6 +429,7 @@
   .hero-actions,
   .form-actions,
   .clip-actions,
+  .metadata-expanded-header,
   .recipe-headline,
   .viewer-footer,
   .panel-header {
