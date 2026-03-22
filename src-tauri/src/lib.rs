@@ -19,10 +19,11 @@ struct GlbSummary {
   node_names: Vec<String>,
   target_node_names: Vec<String>,
   rig_profile: RigProfile,
+  rig_diagnostics: RigDiagnostics,
   animation_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RigProfile {
   root: Option<String>,
@@ -46,6 +47,44 @@ struct RigProfile {
   right_thigh: Option<String>,
   right_calf: Option<String>,
   right_foot: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RigDiagnostics {
+  mesh_count: usize,
+  primitive_count: usize,
+  material_count: usize,
+  skin_count: usize,
+  joint_count: usize,
+  named_node_count: usize,
+  targetable_node_count: usize,
+  resolved_rig_slot_count: usize,
+  total_rig_slot_count: usize,
+  detected_humanoid_score: f32,
+  rig_status: String,
+  rigging_needed: bool,
+  notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RigProposal {
+  source: String,
+  rigging_needed: bool,
+  confidence: f32,
+  readiness: String,
+  rationale: String,
+  proposed_rig_profile: RigProfile,
+  unresolved_slots: Vec<String>,
+  recommended_actions: Vec<String>,
+  warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateRigProposalInput {
+  summary: GlbSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +231,93 @@ fn normalize_lookup_key(value: &str) -> String {
     .collect()
 }
 
+fn rig_slot_labels() -> [&'static str; 21] {
+  [
+    "root",
+    "pelvis",
+    "spine",
+    "chest",
+    "neck",
+    "head",
+    "jaw",
+    "leftShoulder",
+    "leftUpperArm",
+    "leftForearm",
+    "leftHand",
+    "rightShoulder",
+    "rightUpperArm",
+    "rightForearm",
+    "rightHand",
+    "leftThigh",
+    "leftCalf",
+    "leftFoot",
+    "rightThigh",
+    "rightCalf",
+    "rightFoot",
+  ]
+}
+
+fn resolved_rig_slot_count(rig_profile: &RigProfile) -> usize {
+  [
+    rig_profile.root.as_ref(),
+    rig_profile.pelvis.as_ref(),
+    rig_profile.spine.as_ref(),
+    rig_profile.chest.as_ref(),
+    rig_profile.neck.as_ref(),
+    rig_profile.head.as_ref(),
+    rig_profile.jaw.as_ref(),
+    rig_profile.left_shoulder.as_ref(),
+    rig_profile.left_upper_arm.as_ref(),
+    rig_profile.left_forearm.as_ref(),
+    rig_profile.left_hand.as_ref(),
+    rig_profile.right_shoulder.as_ref(),
+    rig_profile.right_upper_arm.as_ref(),
+    rig_profile.right_forearm.as_ref(),
+    rig_profile.right_hand.as_ref(),
+    rig_profile.left_thigh.as_ref(),
+    rig_profile.left_calf.as_ref(),
+    rig_profile.left_foot.as_ref(),
+    rig_profile.right_thigh.as_ref(),
+    rig_profile.right_calf.as_ref(),
+    rig_profile.right_foot.as_ref(),
+  ]
+  .into_iter()
+  .filter(|slot| slot.is_some())
+  .count()
+}
+
+fn unresolved_rig_slots(rig_profile: &RigProfile) -> Vec<String> {
+  let slots = [
+    ("root", rig_profile.root.as_ref()),
+    ("pelvis", rig_profile.pelvis.as_ref()),
+    ("spine", rig_profile.spine.as_ref()),
+    ("chest", rig_profile.chest.as_ref()),
+    ("neck", rig_profile.neck.as_ref()),
+    ("head", rig_profile.head.as_ref()),
+    ("jaw", rig_profile.jaw.as_ref()),
+    ("leftShoulder", rig_profile.left_shoulder.as_ref()),
+    ("leftUpperArm", rig_profile.left_upper_arm.as_ref()),
+    ("leftForearm", rig_profile.left_forearm.as_ref()),
+    ("leftHand", rig_profile.left_hand.as_ref()),
+    ("rightShoulder", rig_profile.right_shoulder.as_ref()),
+    ("rightUpperArm", rig_profile.right_upper_arm.as_ref()),
+    ("rightForearm", rig_profile.right_forearm.as_ref()),
+    ("rightHand", rig_profile.right_hand.as_ref()),
+    ("leftThigh", rig_profile.left_thigh.as_ref()),
+    ("leftCalf", rig_profile.left_calf.as_ref()),
+    ("leftFoot", rig_profile.left_foot.as_ref()),
+    ("rightThigh", rig_profile.right_thigh.as_ref()),
+    ("rightCalf", rig_profile.right_calf.as_ref()),
+    ("rightFoot", rig_profile.right_foot.as_ref()),
+  ];
+
+  slots
+    .into_iter()
+    .filter(|(_, value)| value.is_none())
+    .map(|(label, _)| label.to_string())
+    .collect()
+}
+
 fn find_profile_node(candidates: &[String], keywords: &[&str]) -> Option<String> {
   let normalized_candidates = candidates
     .iter()
@@ -247,6 +373,153 @@ fn build_rig_profile(node_names: &[String]) -> RigProfile {
     right_calf: find_profile_node(node_names, &["rightleg", "rightcalf", "legr", "calfr", "rcalf"]),
     right_foot: find_profile_node(node_names, &["rightfoot", "footr", "rfoot"]),
   }
+}
+
+fn build_rig_diagnostics(document: &gltf::Gltf, rig_profile: &RigProfile, target_node_names: &[String]) -> RigDiagnostics {
+  let mesh_count = document.meshes().count();
+  let primitive_count = document.meshes().map(|mesh| mesh.primitives().count()).sum();
+  let material_count = document.materials().count();
+  let skin_count = document.skins().count();
+  let joint_count: usize = document.skins().map(|skin| skin.joints().count()).sum();
+  let named_node_count = document.nodes().filter(|node| node.name().is_some()).count();
+  let resolved_rig_slot_count = resolved_rig_slot_count(rig_profile);
+  let total_rig_slot_count = rig_slot_labels().len();
+  let detected_humanoid_score = ((resolved_rig_slot_count as f32 / total_rig_slot_count as f32) * 0.65
+    + ((joint_count.min(24) as f32 / 24.0) * 0.25)
+    + ((target_node_names.len().min(24) as f32 / 24.0) * 0.10))
+    .clamp(0.0, 1.0);
+
+  let rig_status = if skin_count > 0 && joint_count >= 12 && resolved_rig_slot_count >= 8 {
+    "rigged"
+  } else if skin_count > 0 || joint_count >= 4 || resolved_rig_slot_count >= 4 {
+    "partial"
+  } else if mesh_count > 0 {
+    "unrigged"
+  } else {
+    "unknown"
+  }
+  .to_string();
+
+  let rigging_needed = rig_status != "rigged";
+  let mut notes = Vec::new();
+
+  if mesh_count == 0 {
+    notes.push("No mesh objects were found in the source asset.".to_string());
+  }
+
+  if skin_count == 0 {
+    notes.push("No glTF skin data was detected, so the asset is not currently skinned for skeletal animation export.".to_string());
+  }
+
+  if joint_count == 0 {
+    notes.push("No skin joints were detected in the source file.".to_string());
+  }
+
+  if resolved_rig_slot_count < 6 {
+    notes.push("Only a small subset of canonical humanoid joints could be inferred from current node names.".to_string());
+  }
+
+  if !target_node_names.iter().any(|node| normalize_lookup_key(node).contains("hand")) {
+    notes.push("No obvious hand targets were detected, which limits expressive prompt-driven arm motion.".to_string());
+  }
+
+  RigDiagnostics {
+    mesh_count,
+    primitive_count,
+    material_count,
+    skin_count,
+    joint_count,
+    named_node_count,
+    targetable_node_count: target_node_names.len(),
+    resolved_rig_slot_count,
+    total_rig_slot_count,
+    detected_humanoid_score,
+    rig_status,
+    rigging_needed,
+    notes,
+  }
+}
+
+fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
+  let unresolved_slots = unresolved_rig_slots(&summary.rig_profile);
+  let diagnostics = &summary.rig_diagnostics;
+  let confidence = diagnostics.detected_humanoid_score.clamp(0.0, 1.0);
+  let mut recommended_actions = Vec::new();
+  let mut warnings = Vec::new();
+  let readiness;
+  let rationale;
+
+  if diagnostics.rig_status == "rigged" {
+    readiness = "ready".to_string();
+    rationale = "The asset already looks rigged enough to support canonical targeting. Focus on refining joint naming and retargeting quality instead of generating a fresh skeleton.".to_string();
+    recommended_actions.push("Use the inferred canonical joint profile as the targeting map for prompt generation.".to_string());
+    recommended_actions.push("Review ambiguous or missing slots before exporting production animations.".to_string());
+  } else if diagnostics.rig_status == "partial" {
+    readiness = "needs-remap".to_string();
+    rationale = "The asset has some rig structure, but it is incomplete or inconsistent. A rig proposal should preserve existing joints where possible and fill the missing canonical slots.".to_string();
+    recommended_actions.push("Preserve existing skins and joints, then remap them onto the canonical humanoid profile.".to_string());
+    recommended_actions.push("Generate proposals for unresolved slots before attempting motion export.".to_string());
+    warnings.push("Partial rigs are prone to side-label mistakes and missing limb chains.".to_string());
+  } else {
+    readiness = "needs-rigging".to_string();
+    rationale = "The asset does not appear to have a complete animation-ready rig. Generate a canonical humanoid skeleton proposal and require review before applying any binding changes.".to_string();
+    recommended_actions.push("Infer a humanoid skeleton layout from mesh bounds, hierarchy, and naming hints.".to_string());
+    recommended_actions.push("Create a non-destructive rig proposal before any skin binding is written back to disk.".to_string());
+    warnings.push("This asset may need manual cleanup after any automated rigging pass.".to_string());
+  }
+
+  if diagnostics.skin_count == 0 {
+    warnings.push("No existing skin was found, so downstream export will require new skinning data rather than simple retargeting.".to_string());
+  }
+
+  RigProposal {
+    source: "fallback".to_string(),
+    rigging_needed: diagnostics.rigging_needed,
+    confidence,
+    readiness,
+    rationale,
+    proposed_rig_profile: summary.rig_profile.clone(),
+    unresolved_slots,
+    recommended_actions,
+    warnings,
+  }
+}
+
+fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> RigProposal {
+  proposal.confidence = proposal.confidence.clamp(0.0, 1.0);
+
+  if proposal.source.trim().is_empty() {
+    proposal.source = "fallback".to_string();
+  }
+
+  if proposal.readiness.trim().is_empty() {
+    proposal.readiness = if summary.rig_diagnostics.rigging_needed {
+      "needs-rigging".to_string()
+    } else {
+      "ready".to_string()
+    };
+  }
+
+  if proposal.rationale.trim().is_empty() {
+    proposal.rationale = "Generated a rigging readiness proposal from the current model summary.".to_string();
+  }
+
+  if proposal.recommended_actions.is_empty() {
+    proposal.recommended_actions = fallback_rig_proposal(summary).recommended_actions;
+  }
+
+  if proposal.proposed_rig_profile == RigProfile::default() {
+    proposal.proposed_rig_profile = summary.rig_profile.clone();
+  }
+
+  proposal.unresolved_slots = unresolved_rig_slots(&proposal.proposed_rig_profile);
+
+  if proposal.warnings.is_empty() {
+    proposal.warnings = fallback_rig_proposal(summary).warnings;
+  }
+
+  proposal.rigging_needed = proposal.rigging_needed || summary.rig_diagnostics.rigging_needed;
+  proposal
 }
 
 fn find_matching_target_name(requested_name: &str, summary: &GlbSummary) -> Option<String> {
@@ -729,6 +1002,63 @@ async fn openai_recipe(prompt: &str, summary: &GlbSummary) -> Result<Option<Anim
   Ok(Some(sanitized))
 }
 
+async fn openai_rig_proposal(summary: &GlbSummary) -> Result<Option<RigProposal>, String> {
+  let api_key = match env::var("OPENAI_API_KEY") {
+    Ok(value) if !value.trim().is_empty() => value,
+    _ => return Ok(None),
+  };
+
+  let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
+  let client = reqwest::Client::new();
+  let request_body = json!({
+    "model": model,
+    "response_format": { "type": "json_object" },
+    "messages": [
+      {
+        "role": "system",
+        "content": "You analyze 3D character assets for rigging readiness. Return JSON only. You never claim that rigging has been applied. Instead, return a cautious proposal with these keys: source, riggingNeeded, confidence, readiness, rationale, proposedRigProfile, unresolvedSlots, recommendedActions, warnings. proposedRigProfile must use the canonical keys root, pelvis, spine, chest, neck, head, jaw, leftShoulder, leftUpperArm, leftForearm, leftHand, rightShoulder, rightUpperArm, rightForearm, rightHand, leftThigh, leftCalf, leftFoot, rightThigh, rightCalf, rightFoot."
+      },
+      {
+        "role": "user",
+        "content": format!(
+          "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nReturn a cautious rigging proposal. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps.",
+          serde_json::to_string(summary).map_err(|error| error.to_string())?,
+          serde_json::to_string(&summary.rig_diagnostics).map_err(|error| error.to_string())?
+        )
+      }
+    ]
+  });
+
+  let response = client
+    .post("https://api.openai.com/v1/chat/completions")
+    .bearer_auth(api_key)
+    .json(&request_body)
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+  if !response.status().is_success() {
+    return Err(format!("OpenAI rig proposal request failed with status {}", response.status()));
+  }
+
+  let payload = response
+    .json::<serde_json::Value>()
+    .await
+    .map_err(|error| error.to_string())?;
+  let content = payload
+    .get("choices")
+    .and_then(|choices| choices.get(0))
+    .and_then(|choice| choice.get("message"))
+    .and_then(|message| message.get("content"))
+    .and_then(|content| content.as_str())
+    .ok_or_else(|| "OpenAI response did not contain JSON content for rig proposal.".to_string())?;
+
+  let mut proposal = serde_json::from_str::<RigProposal>(content)
+    .map_err(|error| format!("OpenAI returned invalid JSON for a rig proposal: {error}"))?;
+  proposal.source = "openai".to_string();
+  Ok(Some(sanitize_rig_proposal(proposal, summary)))
+}
+
 #[tauri::command]
 async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
   let canonical_path = fs::canonicalize(PathBuf::from(file_path.clone()))
@@ -779,6 +1109,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     .take(96)
     .collect::<Vec<_>>();
   let rig_profile = build_rig_profile(&node_names);
+  let rig_diagnostics = build_rig_diagnostics(&document, &rig_profile, &target_node_names);
   let animation_names = document
     .animations()
     .enumerate()
@@ -805,6 +1136,7 @@ async fn inspect_glb(file_path: String) -> Result<GlbSummary, String> {
     node_names,
     target_node_names,
     rig_profile,
+    rig_diagnostics,
     animation_names,
   })
 }
@@ -848,6 +1180,18 @@ async fn generate_animation_recipe(input: GenerateAnimationInput) -> Result<Anim
     Err(error) => {
       log::warn!("OpenAI animation generation failed, using fallback recipe: {error}");
       Ok(fallback_recipe(&input.prompt, &input.summary))
+    }
+  }
+}
+
+#[tauri::command]
+async fn generate_rig_proposal(input: GenerateRigProposalInput) -> Result<RigProposal, String> {
+  match openai_rig_proposal(&input.summary).await {
+    Ok(Some(proposal)) => Ok(proposal),
+    Ok(None) => Ok(fallback_rig_proposal(&input.summary)),
+    Err(error) => {
+      log::warn!("OpenAI rig proposal generation failed, using fallback proposal: {error}");
+      Ok(fallback_rig_proposal(&input.summary))
     }
   }
 }
@@ -908,6 +1252,7 @@ pub fn run() {
       inspect_glb,
       read_glb_binary,
       generate_animation_recipe,
+      generate_rig_proposal,
       list_saved_animation_clips,
       save_animation_clip,
       write_binary_file

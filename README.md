@@ -11,6 +11,8 @@ Desktop MVP for loading a GLB or GLTF file, previewing it in Three.js, and gener
 - Node- and bone-targeted playback for prompts that imply local body motion like head turns, laughs, and pointing
 - Local clip library for saving generated recipes per source model
 - Export action that writes a new GLB with the generated clip embedded as a native animation
+- Rig diagnostics that classify loaded assets as rigged, partial, or unrigged
+- Rig proposal analysis with optional OpenAI assistance and a local fallback proposal path
 - Optional OpenAI-backed recipe generation when `OPENAI_API_KEY` is present
 - Deterministic local fallback recipe generator when no AI credentials are configured
 
@@ -68,6 +70,19 @@ Current limitation:
 
 The next major feature after animation export is an AI-assisted rigging workflow for raw, poorly structured, or unrigged GLB files.
 
+Current implemented slice:
+
+- Diagnose the asset's current rig state from glTF metadata
+- Infer a canonical humanoid rig profile from discovered node names
+- Generate a cautious rig proposal with confidence, unresolved slots, recommendations, and warnings
+- Keep the workflow analysis-only and non-destructive for now
+
+Not implemented yet:
+
+- Writing a newly rigged skeleton back into the asset
+- Generating or rebinding skin weights
+- Applying an AI rig proposal directly to the source model
+
 Goal:
 
 - Take a source GLB that lacks a clean humanoid rig
@@ -113,5 +128,6 @@ Initial constraints to respect:
 
 - Improve targeting quality with per-model retargeting profiles and better side detection for limbs
 - Add rig-health metadata so the app can distinguish rigged, partially rigged, and unrigged assets
-- Design the AI rig proposal data contract and review flow
+- Add an "apply rig proposal" workflow after the proposal review step exists
+- Design mesh-binding and skin-weight generation for assets that currently have no skin data
 - Add tests around prompt parsing, target matching, export generation, and GLB metadata extraction

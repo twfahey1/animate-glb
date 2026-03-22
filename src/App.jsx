@@ -58,6 +58,22 @@ function buildBrowserSummary(file) {
     sceneNames: [],
     nodeNames: [],
     targetNodeNames: [],
+    rigProfile: {},
+    rigDiagnostics: {
+      meshCount: 0,
+      primitiveCount: 0,
+      materialCount: 0,
+      skinCount: 0,
+      jointCount: 0,
+      namedNodeCount: 0,
+      targetableNodeCount: 0,
+      resolvedRigSlotCount: 0,
+      totalRigSlotCount: 21,
+      detectedHumanoidScore: 0,
+      rigStatus: 'unknown',
+      riggingNeeded: true,
+      notes: ['Browser mode does not run Rust-side rig diagnostics.'],
+    },
     animationNames: [],
   }
 }
@@ -82,6 +98,34 @@ function formatRigSlot(slotName) {
   return slotName
     .replace(/([A-Z])/g, ' $1')
     .replace(/^./, (character) => character.toUpperCase())
+}
+
+function formatRigStatus(status) {
+  if (!status) {
+    return 'Unknown'
+  }
+
+  if (status === 'partial') {
+    return 'Partial rig'
+  }
+
+  if (status === 'rigged') {
+    return 'Rigged'
+  }
+
+  if (status === 'unrigged') {
+    return 'Unrigged'
+  }
+
+  return status.replace(/(^.|-.?)/g, (segment) => segment.replace('-', ' ').toUpperCase())
+}
+
+function formatConfidence(value) {
+  if (!Number.isFinite(value)) {
+    return '0%'
+  }
+
+  return `${Math.round(value * 100)}%`
 }
 
 function buildLocalRecipe(prompt) {
@@ -157,6 +201,27 @@ function formatSavedTime(epochMs) {
   })
 }
 
+function getErrorMessage(error, fallbackMessage) {
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  if (typeof error === 'string' && error.trim()) {
+    return error
+  }
+
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+    return error.message
+  }
+
+  return fallbackMessage
+}
+
+function isMissingTauriCommand(error, commandName) {
+  const message = getErrorMessage(error, '')
+  return message.includes(`Command ${commandName} not found`)
+}
+
 function slugifyFileToken(value, fallback = 'generated-motion') {
   const normalized = value
     ?.toLowerCase()
@@ -171,6 +236,75 @@ function buildExportFileName(fileName, recipeName) {
   return `${slugifyFileToken(baseName, 'model')}-${slugifyFileToken(recipeName, 'generated-motion')}.glb`
 }
 
+function buildLocalRigProposal(summary, source = 'client-fallback') {
+  const diagnostics = summary?.rigDiagnostics ?? {}
+  const rigProfile = summary?.rigProfile ?? {}
+  const unresolvedSlots = [
+    'root',
+    'pelvis',
+    'spine',
+    'chest',
+    'neck',
+    'head',
+    'jaw',
+    'leftShoulder',
+    'leftUpperArm',
+    'leftForearm',
+    'leftHand',
+    'rightShoulder',
+    'rightUpperArm',
+    'rightForearm',
+    'rightHand',
+    'leftThigh',
+    'leftCalf',
+    'leftFoot',
+    'rightThigh',
+    'rightCalf',
+    'rightFoot',
+  ].filter((slotName) => !rigProfile[slotName])
+
+  const rigStatus = diagnostics.rigStatus ?? 'unknown'
+  const confidence = Number.isFinite(diagnostics.detectedHumanoidScore)
+    ? diagnostics.detectedHumanoidScore
+    : 0
+
+  let readiness = 'needs-rigging'
+  let rationale = 'Built a local rig proposal from the current model summary because backend rig analysis was unavailable.'
+  const recommendedActions = []
+  const warnings = [...(diagnostics.notes ?? [])]
+
+  if (rigStatus === 'rigged') {
+    readiness = 'ready'
+    rationale = 'The current model summary already indicates a usable rig. A local fallback proposal is enough to continue targeting work.'
+    recommendedActions.push('Use the canonical joint profile as the active targeting map for prompt generation.')
+    recommendedActions.push('Review any unresolved slots before exporting production-ready animation assets.')
+  } else if (rigStatus === 'partial') {
+    readiness = 'needs-remap'
+    rationale = 'The current model summary suggests a partial rig. Continue with remapping and unresolved-slot review before any destructive rigging step.'
+    recommendedActions.push('Preserve existing joints and map them onto the canonical humanoid profile.')
+    recommendedActions.push('Resolve missing limb and torso slots before attempting reusable downstream exports.')
+  } else {
+    recommendedActions.push('Treat this as an analysis-only result until backend rig proposal generation is available.')
+    recommendedActions.push('Review the rig health panel to confirm whether the asset needs a new skeleton or just better naming.')
+  }
+
+  if (!warnings.length) {
+    warnings.push('This proposal was generated locally from the loaded summary and may be less specific than the Rust-side analysis path.')
+  }
+
+  return {
+    source,
+    riggingNeeded: diagnostics.riggingNeeded ?? true,
+    confidence,
+    readiness,
+    rationale,
+    proposedRigProfile: rigProfile,
+    unresolvedSlots,
+    recommendedActions,
+    warnings,
+  }
+}
+
 function App() {
   const browserInputRef = useRef(null)
   const browserObjectUrlRef = useRef('')
@@ -182,6 +316,7 @@ function App() {
   const [viewerFilePath, setViewerFilePath] = useState('')
   const [recipe, setRecipe] = useState(null)
   const [savedClips, setSavedClips] = useState([])
+  const [rigProposal, setRigProposal] = useState(null)
   const [activeSavedClipId, setActiveSavedClipId] = useState('')
   const [viewerStatus, setViewerStatus] = useState('Choose a GLB to inspect and preview.')
   const [errorMessage, setErrorMessage] = useState('')
@@ -192,6 +327,7 @@ function App() {
   const [isLoadingSavedClips, setIsLoadingSavedClips] = useState(false)
   const [isSavingClip, setIsSavingClip] = useState(false)
   const [isExportingGlb, setIsExportingGlb] = useState(false)
+  const [isGeneratingRigProposal, setIsGeneratingRigProposal] = useState(false)
 
   useEffect(() => {
     return () => {
@@ -252,6 +388,7 @@ function App() {
       setActiveSavedClipId('')
       setShowAllNodes(false)
       setShowAllTargetNodes(false)
+      setRigProposal(null)
       setRecipe(null)
     })
   }
@@ -297,6 +434,7 @@ function App() {
         setActiveSavedClipId('')
         setShowAllNodes(false)
         setShowAllTargetNodes(false)
+        setRigProposal(null)
         setRecipe(null)
       })
     } catch (error) {
@@ -376,6 +514,50 @@ function App() {
       setErrorMessage(error instanceof Error ? error.message : 'Unable to save this animation clip.')
     } finally {
       setIsSavingClip(false)
+    }
+  }
+
+  async function handleGenerateRigProposal() {
+    if (!summary) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsGeneratingRigProposal(true)
+
+    try {
+      if (!isTauriRuntime) {
+        setRigProposal({
+          ...buildLocalRigProposal(summary, 'browser'),
+          readiness: 'browser-limited',
+          rationale:
+            'Rig proposal generation requires the Rust desktop path because browser mode does not run the deeper rig diagnostics pipeline.',
+          recommendedActions: ['Run the app in npm run tauri:dev to inspect and plan rigging for this model.'],
+          warnings: ['Browser mode cannot inspect skins, joints, or glTF rig structure.'],
+        })
+        return
+      }
+
+      const nextProposal = await invoke('generate_rig_proposal', {
+        input: {
+          summary,
+        },
+      })
+
+      startTransition(() => {
+        setRigProposal(nextProposal)
+      })
+    } catch (error) {
+      const message = getErrorMessage(error, 'Unable to analyze rigging for this model.')
+      const resolvedMessage = isMissingTauriCommand(error, 'generate_rig_proposal')
+        ? 'The running desktop app does not include the new rigging command yet. Restart npm run tauri:dev and try Analyze rigging again. Showing a local fallback rig proposal instead.'
+        : `${message} Showing a local fallback rig proposal instead.`
+      startTransition(() => {
+        setRigProposal(buildLocalRigProposal(summary))
+      })
+      setErrorMessage(resolvedMessage)
+    } finally {
+      setIsGeneratingRigProposal(false)
     }
   }
 
@@ -634,6 +816,136 @@ function App() {
                   No canonical rig profile could be inferred from the currently captured node names.
                 </p>
               )}
+            </div>
+
+            <div className="metadata-expanded-card">
+              <div className="metadata-expanded-header">
+                <div>
+                  <p className="label">Rig health</p>
+                  <h3>Rigging readiness</h3>
+                </div>
+                <span className={`status-chip status-${summary?.rigDiagnostics?.rigStatus ?? 'unknown'}`}>
+                  {formatRigStatus(summary?.rigDiagnostics?.rigStatus)}
+                </span>
+              </div>
+              <div className="rig-diagnostics-grid">
+                <div>
+                  <dt>Meshes</dt>
+                  <dd>{summary?.rigDiagnostics?.meshCount ?? 0}</dd>
+                </div>
+                <div>
+                  <dt>Skins</dt>
+                  <dd>{summary?.rigDiagnostics?.skinCount ?? 0}</dd>
+                </div>
+                <div>
+                  <dt>Joints</dt>
+                  <dd>{summary?.rigDiagnostics?.jointCount ?? 0}</dd>
+                </div>
+                <div>
+                  <dt>Resolved slots</dt>
+                  <dd>
+                    {summary?.rigDiagnostics?.resolvedRigSlotCount ?? 0}/
+                    {summary?.rigDiagnostics?.totalRigSlotCount ?? 0}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Humanoid score</dt>
+                  <dd>{formatConfidence(summary?.rigDiagnostics?.detectedHumanoidScore)}</dd>
+                </div>
+              </div>
+              {summary?.rigDiagnostics?.notes?.length ? (
+                <ul className="detail-list">
+                  {summary.rigDiagnostics.notes.map((note) => (
+                    <li key={note}>{note}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="metadata-note">No additional rigging notes were recorded for this asset.</p>
+              )}
+            </div>
+          </section>
+
+          <section className="panel prompt-panel">
+            <div className="panel-header compact">
+              <div>
+                <p className="panel-kicker">Rigging</p>
+                <h2>Rig proposal</h2>
+              </div>
+              <span className="pill">{rigProposal ? rigProposal.source : 'Awaiting analysis'}</span>
+            </div>
+
+            <div className="recipe-card">
+              <div className="recipe-headline">
+                <div>
+                  <p className="label">Current result</p>
+                  <h3>{rigProposal ? formatRigStatus(rigProposal.readiness) : 'No rig proposal yet'}</h3>
+                </div>
+                <span className="duration-badge">
+                  {rigProposal ? formatConfidence(rigProposal.confidence) : '0%'}
+                </span>
+              </div>
+
+              <p className="recipe-rationale">
+                {rigProposal?.rationale ??
+                  'Analyze the current model to determine whether it is already rigged, partially rigged, or still needs a canonical rig proposal.'}
+              </p>
+
+              <div className="clip-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleGenerateRigProposal}
+                  disabled={!summary || isGeneratingRigProposal}
+                >
+                  {isGeneratingRigProposal ? 'Analyzing rig…' : 'Analyze rigging'}
+                </button>
+                <span className="clip-actions-note">
+                  {rigProposal
+                    ? rigProposal.riggingNeeded
+                      ? 'Proposal indicates this asset still needs rigging or remapping before a full rigging pipeline can be applied.'
+                      : 'Proposal indicates the current asset is already usable for rig-aware animation targeting.'
+                    : 'This step is analysis only. It does not modify the loaded asset.'}
+                </span>
+              </div>
+
+              {rigProposal ? (
+                <>
+                  {rigProposal.recommendedActions?.length ? (
+                    <div className="detail-block">
+                      <p className="label">Recommended actions</p>
+                      <ul className="detail-list">
+                        {rigProposal.recommendedActions.map((action) => (
+                          <li key={action}>{action}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+
+                  {rigProposal.unresolvedSlots?.length ? (
+                    <div className="detail-block">
+                      <p className="label">Unresolved slots</p>
+                      <div className="token-list">
+                        {rigProposal.unresolvedSlots.map((slotName) => (
+                          <span className="token-chip" key={slotName}>
+                            {formatRigSlot(slotName)}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {rigProposal.warnings?.length ? (
+                    <div className="detail-block">
+                      <p className="label">Warnings</p>
+                      <ul className="detail-list">
+                        {rigProposal.warnings.map((warning) => (
+                          <li key={warning}>{warning}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
             </div>
           </section>
 
