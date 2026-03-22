@@ -121,6 +121,19 @@ function buildLocalRecipe(prompt) {
   }
 }
 
+function formatSavedTime(epochMs) {
+  if (!epochMs) {
+    return ''
+  }
+
+  return new Date(Number(epochMs)).toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
 function App() {
   const browserInputRef = useRef(null)
   const browserObjectUrlRef = useRef('')
@@ -130,10 +143,14 @@ function App() {
   const [viewerUrl, setViewerUrl] = useState('')
   const [viewerFilePath, setViewerFilePath] = useState('')
   const [recipe, setRecipe] = useState(null)
+  const [savedClips, setSavedClips] = useState([])
+  const [activeSavedClipId, setActiveSavedClipId] = useState('')
   const [viewerStatus, setViewerStatus] = useState('Choose a GLB to inspect and preview.')
   const [errorMessage, setErrorMessage] = useState('')
   const [isPickingModel, setIsPickingModel] = useState(false)
   const [isGeneratingRecipe, setIsGeneratingRecipe] = useState(false)
+  const [isLoadingSavedClips, setIsLoadingSavedClips] = useState(false)
+  const [isSavingClip, setIsSavingClip] = useState(false)
 
   useEffect(() => {
     return () => {
@@ -142,6 +159,33 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    if (!isTauriRuntime) {
+      return
+    }
+
+    async function loadSavedClips() {
+      setIsLoadingSavedClips(true)
+
+      try {
+        const clips = await invoke('list_saved_animation_clips')
+        setSavedClips(clips)
+      } catch (error) {
+        setErrorMessage(
+          error instanceof Error ? error.message : 'Unable to load saved animation clips.',
+        )
+      } finally {
+        setIsLoadingSavedClips(false)
+      }
+    }
+
+    loadSavedClips()
+  }, [isTauriRuntime])
+
+  const filteredSavedClips = summary
+    ? savedClips.filter((clip) => clip.modelFilePath === summary.filePath)
+    : []
 
   function applyBrowserFile(file) {
     if (!file) {
@@ -164,6 +208,7 @@ function App() {
       setSummary(buildBrowserSummary(file))
       setViewerUrl(objectUrl)
       setViewerFilePath('')
+      setActiveSavedClipId('')
       setRecipe(null)
     })
   }
@@ -206,6 +251,7 @@ function App() {
         setSummary(nextSummary)
         setViewerUrl('')
         setViewerFilePath(nextSummary.filePath)
+        setActiveSavedClipId('')
         setRecipe(null)
       })
     } catch (error) {
@@ -228,6 +274,7 @@ function App() {
     try {
       if (!isTauriRuntime) {
         startTransition(() => {
+          setActiveSavedClipId('')
           setRecipe(buildLocalRecipe(prompt))
         })
         return
@@ -241,6 +288,7 @@ function App() {
       })
 
       startTransition(() => {
+        setActiveSavedClipId('')
         setRecipe(nextRecipe)
       })
     } catch (error) {
@@ -252,6 +300,46 @@ function App() {
     } finally {
       setIsGeneratingRecipe(false)
     }
+  }
+
+  async function handleSaveClip() {
+    if (!isTauriRuntime || !summary || !recipe) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsSavingClip(true)
+
+    try {
+      const savedClip = await invoke('save_animation_clip', {
+        input: {
+          prompt,
+          summary,
+          recipe,
+        },
+      })
+
+      startTransition(() => {
+        setSavedClips((currentClips) => [
+          savedClip,
+          ...currentClips.filter((clip) => clip.id !== savedClip.id),
+        ])
+        setActiveSavedClipId(savedClip.id)
+        setRecipe(savedClip.recipe)
+      })
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to save this animation clip.')
+    } finally {
+      setIsSavingClip(false)
+    }
+  }
+
+  function handlePlaySavedClip(savedClip) {
+    startTransition(() => {
+      setActiveSavedClipId(savedClip.id)
+      setPrompt(savedClip.prompt)
+      setRecipe(savedClip.recipe)
+    })
   }
 
   return (
@@ -392,7 +480,10 @@ function App() {
                 <button
                   className="secondary-button"
                   type="button"
-                  onClick={() => setRecipe(null)}
+                  onClick={() => {
+                    setActiveSavedClipId('')
+                    setRecipe(null)
+                  }}
                   disabled={!recipe}
                 >
                   Clear recipe
@@ -418,6 +509,22 @@ function App() {
                   'The backend will return a transform-based recipe that the viewer converts into a Three.js animation clip.'}
               </p>
 
+              <div className="clip-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleSaveClip}
+                  disabled={!isTauriRuntime || !summary || !recipe || isSavingClip}
+                >
+                  {isSavingClip ? 'Saving…' : 'Save'}
+                </button>
+                <span className="clip-actions-note">
+                  {activeSavedClipId
+                    ? 'Saved clip selected for playback.'
+                    : 'Save this result to replay it later for the current model.'}
+                </span>
+              </div>
+
               <ul className="track-list">
                 {(recipe?.tracks ?? []).map((track) => (
                   <li key={`${track.targetName ?? 'root'}-${track.binding}-${track.times.join('-')}`}>
@@ -426,6 +533,42 @@ function App() {
                   </li>
                 ))}
               </ul>
+            </div>
+
+            <div className="saved-clips-card">
+              <div className="recipe-headline">
+                <div>
+                  <p className="label">Library</p>
+                  <h3>Saved clips</h3>
+                </div>
+                <span className="duration-badge">{filteredSavedClips.length}</span>
+              </div>
+
+              {!summary ? (
+                <p className="recipe-rationale">Load a model to browse clips saved for it.</p>
+              ) : isLoadingSavedClips ? (
+                <p className="recipe-rationale">Loading saved clips…</p>
+              ) : filteredSavedClips.length ? (
+                <ul className="saved-clip-list">
+                  {filteredSavedClips.map((savedClip) => (
+                    <li key={savedClip.id}>
+                      <button
+                        className={`saved-clip-button ${activeSavedClipId === savedClip.id ? 'is-active' : ''}`}
+                        type="button"
+                        onClick={() => handlePlaySavedClip(savedClip)}
+                      >
+                        <span className="saved-clip-title">{savedClip.recipe.name}</span>
+                        <span className="saved-clip-meta">
+                          {formatSavedTime(savedClip.savedAtEpochMs)} · {savedClip.recipe.durationSeconds.toFixed(1)}s
+                        </span>
+                        <span className="saved-clip-prompt">{savedClip.prompt}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="recipe-rationale">No saved clips for {summary.fileName} yet.</p>
+              )}
             </div>
           </section>
         </div>

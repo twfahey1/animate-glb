@@ -3,6 +3,8 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +54,66 @@ struct GenerateAnimationInput {
 struct GlbBinaryPayload {
   file_name: String,
   bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedAnimationClip {
+  id: String,
+  model_file_path: String,
+  model_file_name: String,
+  prompt: String,
+  saved_at_epoch_ms: u128,
+  recipe: AnimationRecipe,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveAnimationClipInput {
+  prompt: String,
+  summary: GlbSummary,
+  recipe: AnimationRecipe,
+}
+
+fn saved_clips_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let app_data_dir = app_handle
+    .path()
+    .app_data_dir()
+    .map_err(|error| format!("Unable to locate the app data directory: {error}"))?;
+
+  fs::create_dir_all(&app_data_dir)
+    .map_err(|error| format!("Unable to create the app data directory: {error}"))?;
+
+  Ok(app_data_dir.join("saved-animation-clips.json"))
+}
+
+fn read_saved_animation_clips(app_handle: &tauri::AppHandle) -> Result<Vec<SavedAnimationClip>, String> {
+  let file_path = saved_clips_file_path(app_handle)?;
+
+  if !file_path.exists() {
+    return Ok(Vec::new());
+  }
+
+  let content = fs::read_to_string(&file_path)
+    .map_err(|error| format!("Unable to read saved clips from disk: {error}"))?;
+
+  if content.trim().is_empty() {
+    return Ok(Vec::new());
+  }
+
+  serde_json::from_str::<Vec<SavedAnimationClip>>(&content)
+    .map_err(|error| format!("Saved clip data is invalid JSON: {error}"))
+}
+
+fn write_saved_animation_clips(
+  app_handle: &tauri::AppHandle,
+  clips: &[SavedAnimationClip],
+) -> Result<(), String> {
+  let file_path = saved_clips_file_path(app_handle)?;
+  let content = serde_json::to_string_pretty(clips)
+    .map_err(|error| format!("Unable to serialize saved clips: {error}"))?;
+
+  fs::write(file_path, content).map_err(|error| format!("Unable to write saved clips: {error}"))
 }
 
 fn sampled_curve(points: &[(f32, f32)]) -> (Vec<f32>, Vec<f32>) {
@@ -632,6 +694,44 @@ async fn generate_animation_recipe(input: GenerateAnimationInput) -> Result<Anim
   }
 }
 
+#[tauri::command]
+fn list_saved_animation_clips(app_handle: tauri::AppHandle) -> Result<Vec<SavedAnimationClip>, String> {
+  read_saved_animation_clips(&app_handle)
+}
+
+#[tauri::command]
+fn save_animation_clip(
+  app_handle: tauri::AppHandle,
+  input: SaveAnimationClipInput,
+) -> Result<SavedAnimationClip, String> {
+  let mut clips = read_saved_animation_clips(&app_handle)?;
+  let saved_at_epoch_ms = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map_err(|error| format!("System clock error while saving clip: {error}"))?
+    .as_millis();
+
+  let mut recipe = sanitize_recipe(input.recipe, &input.summary);
+
+  if recipe.tracks.is_empty() {
+    recipe = fallback_recipe(&input.prompt, &input.summary);
+  }
+
+  let saved_clip = SavedAnimationClip {
+    id: format!("clip-{saved_at_epoch_ms}"),
+    model_file_path: input.summary.file_path.clone(),
+    model_file_name: input.summary.file_name.clone(),
+    prompt: input.prompt,
+    saved_at_epoch_ms,
+    recipe,
+  };
+
+  clips.retain(|clip| clip.id != saved_clip.id);
+  clips.insert(0, saved_clip.clone());
+  write_saved_animation_clips(&app_handle, &clips)?;
+
+  Ok(saved_clip)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -646,7 +746,13 @@ pub fn run() {
       }
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![inspect_glb, read_glb_binary, generate_animation_recipe])
+    .invoke_handler(tauri::generate_handler![
+      inspect_glb,
+      read_glb_binary,
+      generate_animation_recipe,
+      list_saved_animation_clips,
+      save_animation_clip
+    ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
