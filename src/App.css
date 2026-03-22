@@ -88,6 +88,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1.7fr) minmax(360px, 1fr);
   gap: 24px;
+  align-items: start;
 }
 
 .control-column {
@@ -99,6 +100,11 @@
 .metadata-panel,
 .prompt-panel {
   padding: 20px;
+}
+
+.viewer-panel {
+  position: sticky;
+  top: 24px;
 }
 
 .panel-header.compact {
@@ -418,6 +424,11 @@
 @media (max-width: 1100px) {
   .workspace-grid {
     grid-template-columns: 1fr;
+  }
+
+  .viewer-panel {
+    position: static;
+    top: auto;
   }
 }
 
