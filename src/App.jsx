@@ -981,6 +981,7 @@ function App() {
 
       const nextProposal = await invoke('generate_rig_proposal', {
         input: {
+          geometryAnalysis: nextGeometryAnalysis,
           summary,
         },
       })
@@ -1051,6 +1052,7 @@ function App() {
 
       const nextPlan = await invoke('generate_rig_upgrade_plan', {
         input: {
+          geometryAnalysis: nextGeometryAnalysis,
           summary,
           proposal: rigProposal,
         },
@@ -1528,6 +1530,18 @@ function App() {
                           </span>
                         ))}
                       </div>
+                    </div>
+                  ) : null}
+                  {geometryAnalysis?.groundContacts?.quadrupedContacts ? (
+                    <div className="detail-block">
+                      <p className="label">Ground limb clusters</p>
+                      <ul className="detail-list">
+                        {Object.entries(geometryAnalysis.groundContacts.quadrupedContacts).map(([contactName, contact]) => (
+                          <li key={contactName}>
+                            <strong>{formatRigSlot(contactName)}</strong>: forward {contact.forward}, lateral {contact.lateral}, density {contact.totalDensity ?? contact.count}, supports {contact.supportCount ?? 1}, {contact.isSplitContact ? 'split contact' : 'single contact'}
+                          </li>
+                        ))}
+                      </ul>
                     </div>
                   ) : null}
                 {geometryAnalysis.meshRegions?.length ? (

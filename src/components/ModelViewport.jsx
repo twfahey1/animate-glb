@@ -495,6 +495,180 @@ function buildGeometryClues(size, center, meshRegions, regionBuckets, axes, skin
   }
 }
 
+function clusterGroundContactPoints(points, axes) {
+  if (points.length < 4) {
+    return []
+  }
+
+  const uniquePoints = points.filter(
+    (point, index) =>
+      index ===
+      points.findIndex(
+        (candidate) =>
+          Math.abs(candidate.x - point.x) < 0.001 &&
+          Math.abs(candidate.y - point.y) < 0.001 &&
+          Math.abs(candidate.z - point.z) < 0.001,
+      ),
+  )
+  const clusterRadius = Math.max(
+    0.04,
+    Math.sqrt(
+      uniquePoints.reduce((sum, point) => {
+        const projected = projectHorizontalAxes(point, axes)
+        return sum + projected.forward * projected.forward + projected.lateral * projected.lateral
+      }, 0) / uniquePoints.length,
+    ) * 0.12,
+  )
+  const clusters = []
+
+  uniquePoints.forEach((point) => {
+    const projected = projectHorizontalAxes(point, axes)
+    let bestCluster = null
+    let bestDistance = Number.POSITIVE_INFINITY
+
+    clusters.forEach((cluster) => {
+      const distance = Math.hypot(projected.forward - cluster.forward, projected.lateral - cluster.lateral)
+      if (distance < clusterRadius && distance < bestDistance) {
+        bestDistance = distance
+        bestCluster = cluster
+      }
+    })
+
+    if (!bestCluster) {
+      clusters.push({
+        count: 1,
+        forward: projected.forward,
+        lateral: projected.lateral,
+        y: point.y,
+      })
+      return
+    }
+
+    bestCluster.forward = (bestCluster.forward * bestCluster.count + projected.forward) / (bestCluster.count + 1)
+    bestCluster.lateral = (bestCluster.lateral * bestCluster.count + projected.lateral) / (bestCluster.count + 1)
+    bestCluster.y = (bestCluster.y * bestCluster.count + point.y) / (bestCluster.count + 1)
+    bestCluster.count += 1
+  })
+
+  return clusters
+    .sort((left, right) => right.count - left.count)
+    .slice(0, 8)
+    .map((cluster) => ({
+      count: cluster.count,
+      forward: Number(cluster.forward.toFixed(4)),
+      lateral: Number(cluster.lateral.toFixed(4)),
+      y: Number(cluster.y.toFixed(4)),
+    }))
+}
+
+function summarizeGroundContactGroup(groupName, clusters) {
+  if (!clusters.length) {
+    return null
+  }
+
+  const primary = [...clusters].sort((left, right) => right.count - left.count)[0]
+  const totalDensity = clusters.reduce((sum, cluster) => sum + cluster.count, 0)
+  const minForward = Math.min(...clusters.map((cluster) => cluster.forward))
+  const maxForward = Math.max(...clusters.map((cluster) => cluster.forward))
+  const minLateral = Math.min(...clusters.map((cluster) => cluster.lateral))
+  const maxLateral = Math.max(...clusters.map((cluster) => cluster.lateral))
+
+  return {
+    ...primary,
+    groupName,
+    isSplitContact: clusters.length > 1,
+    spanForward: Number((maxForward - minForward).toFixed(4)),
+    spanLateral: Number((maxLateral - minLateral).toFixed(4)),
+    supportClusters: clusters,
+    supportCount: clusters.length,
+    totalDensity,
+  }
+}
+
+function summarizeQuadrupedGroundContacts(clusters, centerForward, centerLateral) {
+  if (clusters.length < 4) {
+    return null
+  }
+
+  const groups = {
+    frontLeft: [],
+    frontRight: [],
+    hindLeft: [],
+    hindRight: [],
+  }
+
+  clusters.forEach((cluster) => {
+    const frontOrHind = cluster.forward >= centerForward ? 'front' : 'hind'
+    const leftOrRight = cluster.lateral < centerLateral ? 'Left' : 'Right'
+    groups[`${frontOrHind}${leftOrRight}`].push(cluster)
+  })
+
+  const orderedKeys = ['frontLeft', 'frontRight', 'hindLeft', 'hindRight']
+  const groupedContacts = Object.fromEntries(
+    orderedKeys.map((key) => [key, summarizeGroundContactGroup(key, groups[key])]),
+  )
+
+  const resolvedCount = orderedKeys.filter((key) => groupedContacts[key]).length
+
+  if (resolvedCount < 3) {
+    return null
+  }
+
+  return groupedContacts
+}
+
+function collectGroundContactSamples(scene, overallBox, axes) {
+  const floorY = overallBox.min.y
+  const height = Math.max(overallBox.max.y - overallBox.min.y, 0.001)
+  const maxGroundOffset = height * 0.18
+  const samples = []
+  const center = overallBox.getCenter(new THREE.Vector3())
+  const projectedCenter = projectHorizontalAxes(center, axes)
+
+  scene.traverse((node) => {
+    if (!node.isMesh || !node.geometry?.attributes?.position) {
+      return
+    }
+
+    const positionAttribute = node.geometry.attributes.position
+    const sampleStep = Math.max(1, Math.floor(positionAttribute.count / 1800))
+    const vertex = new THREE.Vector3()
+
+    for (let index = 0; index < positionAttribute.count; index += sampleStep) {
+      vertex.fromBufferAttribute(positionAttribute, index)
+      vertex.applyMatrix4(node.matrixWorld)
+
+      if (vertex.y - floorY <= maxGroundOffset) {
+        samples.push(vertex.clone())
+      }
+    }
+  })
+
+  const clusters = clusterGroundContactPoints(samples, axes)
+  return {
+    clusters,
+    quadrupedContacts: summarizeQuadrupedGroundContacts(
+      clusters,
+      projectedCenter.forward,
+      projectedCenter.lateral,
+    ),
+  }
+}
+
+function clusterAverageValue(contactGroup, fieldName, fallbackValue) {
+  if (!contactGroup?.supportClusters?.length) {
+    return fallbackValue
+  }
+
+  const totalDensity = contactGroup.supportClusters.reduce((sum, cluster) => sum + cluster.count, 0) || 1
+  return (
+    contactGroup.supportClusters.reduce(
+      (sum, cluster) => sum + cluster[fieldName] * cluster.count,
+      0,
+    ) / totalDensity
+  )
+}
+
 function pickRegionPoint(regionExtent, pointName, fallbackValue) {
   return regionExtent?.[pointName] ?? fallbackValue
 }
@@ -578,6 +752,7 @@ function analyzeSceneGeometry(scene) {
       .filter(([, values]) => values.length)
       .map(([regionName, values]) => [regionName, buildRegionExtentSummary(values, axes)]),
   )
+  const groundContacts = collectGroundContactSamples(scene, overallBox, axes)
   const geometryClues = buildGeometryClues(size, center, meshRegions, regionBuckets, axes, skinnedMeshCount)
 
   return {
@@ -600,6 +775,7 @@ function analyzeSceneGeometry(scene) {
     regionLandmarks,
     regionExtents,
     geometryClues,
+    groundContacts,
     skinnedMeshCount,
     triangleCount: Number(triangleCount.toFixed(0)),
   }
@@ -757,6 +933,11 @@ function buildQuadrupedAnchorMap(geometryAnalysis) {
   const rightHindLateral = pickRegionPoint(feetExtents, 'right', null)?.lateral ?? lateralCenter + hipSpread
   const headFrontHint = pickRegionPoint(headExtents, 'front', null)?.forward ?? headForward
   const tailBackHint = pickRegionPoint(feetExtents, 'back', null)?.forward ?? tailForward
+  const quadrupedContacts = geometryAnalysis.groundContacts?.quadrupedContacts
+  const frontLeftFootCluster = quadrupedContacts?.frontLeft
+  const frontRightFootCluster = quadrupedContacts?.frontRight
+  const hindLeftFootCluster = quadrupedContacts?.hindLeft
+  const hindRightFootCluster = quadrupedContacts?.hindRight
 
   return {
     root: makeHorizontalPoint(center, axes, lateralCenter, footY, projectedCenter.forward),
@@ -767,21 +948,93 @@ function buildQuadrupedAnchorMap(geometryAnalysis) {
     head: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY, headFrontHint),
     jaw: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY - height * 0.03, headFrontHint + length * 0.04),
     frontLeftShoulder: makeHorizontalPoint(center, axes, leftFrontLateral, bodyY, frontForwardHint),
-    frontLeftUpperLeg: makeHorizontalPoint(center, axes, leftFrontLateral, min.y + height * 0.45, frontForwardHint),
-    frontLeftLowerLeg: makeHorizontalPoint(center, axes, leftFrontLateral, min.y + height * 0.2, frontForwardHint + length * 0.02),
-    frontLeftFoot: makeHorizontalPoint(center, axes, feetExtents?.left?.lateral ?? leftFrontLateral, footY, feetExtents?.front?.forward ?? frontForwardHint + length * 0.06),
+    frontLeftUpperLeg: makeHorizontalPoint(
+      center,
+      axes,
+      leftFrontLateral,
+      min.y + height * 0.45,
+      (frontForwardHint + (frontLeftFootCluster?.forward ?? frontForwardHint)) * 0.5,
+    ),
+    frontLeftLowerLeg: makeHorizontalPoint(
+      center,
+      axes,
+      clusterAverageValue(frontLeftFootCluster, 'lateral', leftFrontLateral),
+      min.y + height * 0.2,
+      clusterAverageValue(frontLeftFootCluster, 'forward', frontForwardHint + length * 0.02),
+    ),
+    frontLeftFoot: makeHorizontalPoint(
+      center,
+      axes,
+      frontLeftFootCluster?.lateral ?? feetExtents?.left?.lateral ?? leftFrontLateral,
+      frontLeftFootCluster?.y ?? footY,
+      frontLeftFootCluster?.forward ?? feetExtents?.front?.forward ?? frontForwardHint + length * 0.06,
+    ),
     frontRightShoulder: makeHorizontalPoint(center, axes, rightFrontLateral, bodyY, frontForwardHint),
-    frontRightUpperLeg: makeHorizontalPoint(center, axes, rightFrontLateral, min.y + height * 0.45, frontForwardHint),
-    frontRightLowerLeg: makeHorizontalPoint(center, axes, rightFrontLateral, min.y + height * 0.2, frontForwardHint + length * 0.02),
-    frontRightFoot: makeHorizontalPoint(center, axes, feetExtents?.right?.lateral ?? rightFrontLateral, footY, feetExtents?.front?.forward ?? frontForwardHint + length * 0.06),
+    frontRightUpperLeg: makeHorizontalPoint(
+      center,
+      axes,
+      rightFrontLateral,
+      min.y + height * 0.45,
+      (frontForwardHint + (frontRightFootCluster?.forward ?? frontForwardHint)) * 0.5,
+    ),
+    frontRightLowerLeg: makeHorizontalPoint(
+      center,
+      axes,
+      clusterAverageValue(frontRightFootCluster, 'lateral', rightFrontLateral),
+      min.y + height * 0.2,
+      clusterAverageValue(frontRightFootCluster, 'forward', frontForwardHint + length * 0.02),
+    ),
+    frontRightFoot: makeHorizontalPoint(
+      center,
+      axes,
+      frontRightFootCluster?.lateral ?? feetExtents?.right?.lateral ?? rightFrontLateral,
+      frontRightFootCluster?.y ?? footY,
+      frontRightFootCluster?.forward ?? feetExtents?.front?.forward ?? frontForwardHint + length * 0.06,
+    ),
     hindLeftHip: makeHorizontalPoint(center, axes, leftHindLateral, pelvisY, hindForwardHint),
-    hindLeftUpperLeg: makeHorizontalPoint(center, axes, leftHindLateral, min.y + height * 0.42, hindForwardHint),
-    hindLeftLowerLeg: makeHorizontalPoint(center, axes, leftHindLateral, min.y + height * 0.19, hindForwardHint - length * 0.02),
-    hindLeftFoot: makeHorizontalPoint(center, axes, feetExtents?.left?.lateral ?? leftHindLateral, footY, feetExtents?.back?.forward ?? hindForwardHint - length * 0.03),
+    hindLeftUpperLeg: makeHorizontalPoint(
+      center,
+      axes,
+      leftHindLateral,
+      min.y + height * 0.42,
+      (hindForwardHint + (hindLeftFootCluster?.forward ?? hindForwardHint)) * 0.5,
+    ),
+    hindLeftLowerLeg: makeHorizontalPoint(
+      center,
+      axes,
+      clusterAverageValue(hindLeftFootCluster, 'lateral', leftHindLateral),
+      min.y + height * 0.19,
+      clusterAverageValue(hindLeftFootCluster, 'forward', hindForwardHint - length * 0.02),
+    ),
+    hindLeftFoot: makeHorizontalPoint(
+      center,
+      axes,
+      hindLeftFootCluster?.lateral ?? feetExtents?.left?.lateral ?? leftHindLateral,
+      hindLeftFootCluster?.y ?? footY,
+      hindLeftFootCluster?.forward ?? feetExtents?.back?.forward ?? hindForwardHint - length * 0.03,
+    ),
     hindRightHip: makeHorizontalPoint(center, axes, rightHindLateral, pelvisY, hindForwardHint),
-    hindRightUpperLeg: makeHorizontalPoint(center, axes, rightHindLateral, min.y + height * 0.42, hindForwardHint),
-    hindRightLowerLeg: makeHorizontalPoint(center, axes, rightHindLateral, min.y + height * 0.19, hindForwardHint - length * 0.02),
-    hindRightFoot: makeHorizontalPoint(center, axes, feetExtents?.right?.lateral ?? rightHindLateral, footY, feetExtents?.back?.forward ?? hindForwardHint - length * 0.03),
+    hindRightUpperLeg: makeHorizontalPoint(
+      center,
+      axes,
+      rightHindLateral,
+      min.y + height * 0.42,
+      (hindForwardHint + (hindRightFootCluster?.forward ?? hindForwardHint)) * 0.5,
+    ),
+    hindRightLowerLeg: makeHorizontalPoint(
+      center,
+      axes,
+      clusterAverageValue(hindRightFootCluster, 'lateral', rightHindLateral),
+      min.y + height * 0.19,
+      clusterAverageValue(hindRightFootCluster, 'forward', hindForwardHint - length * 0.02),
+    ),
+    hindRightFoot: makeHorizontalPoint(
+      center,
+      axes,
+      hindRightFootCluster?.lateral ?? feetExtents?.right?.lateral ?? rightHindLateral,
+      hindRightFootCluster?.y ?? footY,
+      hindRightFootCluster?.forward ?? feetExtents?.back?.forward ?? hindForwardHint - length * 0.03,
+    ),
     tailBase: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.02, hindForwardHint - length * 0.12),
     tailTip: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.1, tailBackHint),
   }
@@ -1076,6 +1329,23 @@ function chooseBoneInfluencesForVertex(vertex, rigDefinition, geometryAnalysis) 
   const forwardMax = axes.forwardAxis === 'z' ? geometryAnalysis.overallBounds.max.z : geometryAnalysis.overallBounds.max.x
   const forwardSpan = Math.max(forwardMax - forwardMin, 0.001)
   const normalizedForward = (projectedVertex.forward - forwardMin) / forwardSpan
+  const quadrupedContacts = geometryAnalysis.groundContacts?.quadrupedContacts
+
+  function matchingQuadrupedContact(slotName) {
+    if (slotName.startsWith('frontLeft')) {
+      return quadrupedContacts?.frontLeft
+    }
+    if (slotName.startsWith('frontRight')) {
+      return quadrupedContacts?.frontRight
+    }
+    if (slotName.startsWith('hindLeft')) {
+      return quadrupedContacts?.hindLeft
+    }
+    if (slotName.startsWith('hindRight')) {
+      return quadrupedContacts?.hindRight
+    }
+    return null
+  }
 
   return Object.entries(anchorMap)
     .map(([slotName, anchorPosition]) => {
@@ -1107,6 +1377,8 @@ function chooseBoneInfluencesForVertex(vertex, rigDefinition, geometryAnalysis) 
           score *= 1.25
         }
       } else if (family === 'quadruped' || family === 'generic-creature') {
+        const matchingContact = matchingQuadrupedContact(slotName)
+
         if (normalizedY < 0.22 && (slotName.includes('Leg') || slotName.includes('Foot') || slotName.includes('Limb'))) {
           score *= 1.45
         }
@@ -1121,6 +1393,33 @@ function chooseBoneInfluencesForVertex(vertex, rigDefinition, geometryAnalysis) 
 
         if (normalizedY > 0.52 && (slotName.includes('spine') || slotName === 'body' || slotName === 'neck' || slotName === 'head')) {
           score *= 1.28
+        }
+
+        if (matchingContact) {
+          const contactDistances = matchingContact.supportClusters?.map((cluster) =>
+            Math.hypot(projectedVertex.forward - cluster.forward, projectedVertex.lateral - cluster.lateral),
+          ) ?? [Math.hypot(projectedVertex.forward - matchingContact.forward, projectedVertex.lateral - matchingContact.lateral)]
+          const nearestContactDistance = Math.max(Math.min(...contactDistances), 0.0001)
+
+          if (slotName.includes('Foot')) {
+            score *= 1 + 0.22 / nearestContactDistance
+            if (normalizedY < 0.12) {
+              score *= 1.7
+            }
+          }
+
+          if (slotName.includes('LowerLeg') || slotName.includes('Lower') || slotName.includes('Calf')) {
+            score *= 1 + 0.16 / nearestContactDistance
+            if (normalizedY < 0.26) {
+              score *= 1.35
+            }
+          }
+
+          if (matchingContact.isSplitContact && slotName.includes('Foot')) {
+            score *= 1.12
+          }
+        } else if (slotName.includes('Foot') && normalizedY < 0.16) {
+          score *= 0.88
         }
       } else if (family === 'arachnid') {
         if (normalizedY < 0.22 && slotName.toLowerCase().includes('leg')) {

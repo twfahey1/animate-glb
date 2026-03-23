@@ -89,6 +89,7 @@ struct RigProposal {
 #[serde(rename_all = "camelCase")]
 struct GenerateRigProposalInput {
   summary: GlbSummary,
+  geometry_analysis: Option<GeometryAnalysis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +126,55 @@ struct RigUpgradePlan {
 struct GenerateRigUpgradeInput {
   summary: GlbSummary,
   proposal: RigProposal,
+  geometry_analysis: Option<GeometryAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AxisPoint {
+  x: f32,
+  y: f32,
+  z: f32,
+  forward: Option<f32>,
+  lateral: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegionExtentSummary {
+  back: Option<AxisPoint>,
+  bottom: Option<AxisPoint>,
+  centroid: Option<AxisPoint>,
+  front: Option<AxisPoint>,
+  left: Option<AxisPoint>,
+  right: Option<AxisPoint>,
+  top: Option<AxisPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeometryClues {
+  candidate_rig_family: Option<String>,
+  dominant_forward_axis: Option<String>,
+  family_confidence: Option<f32>,
+  family_scores: Option<std::collections::BTreeMap<String, f32>>,
+  head_forward_bias: Option<f32>,
+  horizontal_aspect_ratio: Option<f32>,
+  lateral_symmetry: Option<f32>,
+  low_mesh_ratio: Option<f32>,
+  posture: Option<String>,
+  width_to_height_ratio: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeometryAnalysis {
+  geometry_clues: Option<GeometryClues>,
+  mesh_count: Option<usize>,
+  region_extents: Option<std::collections::BTreeMap<String, RegionExtentSummary>>,
+  region_landmarks: Option<std::collections::BTreeMap<String, AxisPoint>>,
+  skinned_mesh_count: Option<usize>,
+  triangle_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +587,45 @@ fn detect_rig_family(
   (best_family, confidence)
 }
 
+fn geometry_guided_rig_family(
+  summary: &GlbSummary,
+  geometry_analysis: Option<&GeometryAnalysis>,
+  fallback_family: &str,
+) -> (String, f32) {
+  let normalized_fallback = normalize_rig_family(fallback_family);
+  let summary_confidence = summary.rig_diagnostics.family_confidence.clamp(0.0, 1.0);
+
+  let Some(geometry_clues) = geometry_analysis.and_then(|analysis| analysis.geometry_clues.as_ref()) else {
+    return (normalized_fallback, summary_confidence);
+  };
+
+  let geometry_family = normalize_rig_family(
+    geometry_clues
+      .candidate_rig_family
+      .as_deref()
+      .unwrap_or(&normalized_fallback),
+  );
+  let geometry_confidence = geometry_clues.family_confidence.unwrap_or(summary_confidence).clamp(0.0, 1.0);
+
+  if geometry_confidence >= summary_confidence + 0.08 || (summary_confidence < 0.45 && geometry_confidence >= 0.5) {
+    return (geometry_family, geometry_confidence);
+  }
+
+  (normalized_fallback, summary_confidence.max(geometry_confidence))
+}
+
+fn geometry_note(geometry_analysis: Option<&GeometryAnalysis>, rig_family: &str) -> Option<String> {
+  let geometry_clues = geometry_analysis?.geometry_clues.as_ref()?;
+  let posture = geometry_clues.posture.clone().unwrap_or_else(|| "measured".to_string());
+  let confidence = geometry_clues.family_confidence.unwrap_or(0.0).clamp(0.0, 1.0);
+  Some(format!(
+    "Geometry analysis suggests a {} {} body plan ({:.0}% confidence).",
+    posture,
+    rig_family.replace('-', " "),
+    confidence * 100.0
+  ))
+}
+
 fn resolved_rig_slot_count(rig_profile: &RigProfile) -> usize {
   [
     rig_profile.root.as_ref(),
@@ -772,13 +861,16 @@ fn build_rig_diagnostics(
   }
 }
 
-fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
-  let rig_family = normalize_rig_family(&summary.rig_diagnostics.detected_rig_family);
+fn fallback_rig_proposal(summary: &GlbSummary, geometry_analysis: Option<&GeometryAnalysis>) -> RigProposal {
+  let (rig_family, family_confidence) = geometry_guided_rig_family(
+    summary,
+    geometry_analysis,
+    &summary.rig_diagnostics.detected_rig_family,
+  );
   let canonical_slots = canonical_slots_for_family(&rig_family);
   let unresolved_slots = unresolved_family_slots(summary, &rig_family);
   let diagnostics = &summary.rig_diagnostics;
-  let confidence = diagnostics
-    .family_confidence
+  let confidence = family_confidence
     .max(diagnostics.detected_humanoid_score)
     .clamp(0.0, 1.0);
   let mut recommended_actions = Vec::new();
@@ -827,6 +919,10 @@ fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
     warnings.push("No existing skin was found, so downstream export will require new skinning data rather than simple retargeting.".to_string());
   }
 
+  if let Some(note) = geometry_note(geometry_analysis, &rig_family) {
+    warnings.push(note.clone());
+  }
+
   RigProposal {
     source: "fallback".to_string(),
     rig_family,
@@ -842,13 +938,26 @@ fn fallback_rig_proposal(summary: &GlbSummary) -> RigProposal {
   }
 }
 
-fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> RigProposal {
+fn sanitize_rig_proposal(
+  mut proposal: RigProposal,
+  summary: &GlbSummary,
+  geometry_analysis: Option<&GeometryAnalysis>,
+) -> RigProposal {
+  let (guided_family, geometry_confidence) = geometry_guided_rig_family(
+    summary,
+    geometry_analysis,
+    if proposal.rig_family.trim().is_empty() {
+      &summary.rig_diagnostics.detected_rig_family
+    } else {
+      &proposal.rig_family
+    },
+  );
   proposal.rig_family = normalize_rig_family(if proposal.rig_family.trim().is_empty() {
-    &summary.rig_diagnostics.detected_rig_family
+    &guided_family
   } else {
     &proposal.rig_family
   });
-  proposal.confidence = proposal.confidence.clamp(0.0, 1.0);
+  proposal.confidence = proposal.confidence.max(geometry_confidence).clamp(0.0, 1.0);
 
   if proposal.source.trim().is_empty() {
     proposal.source = "fallback".to_string();
@@ -867,7 +976,7 @@ fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> Rig
   }
 
   if proposal.recommended_actions.is_empty() {
-    proposal.recommended_actions = fallback_rig_proposal(summary).recommended_actions;
+    proposal.recommended_actions = fallback_rig_proposal(summary, geometry_analysis).recommended_actions;
   }
 
   if proposal.proposed_rig_profile == RigProfile::default() {
@@ -881,16 +990,24 @@ fn sanitize_rig_proposal(mut proposal: RigProposal, summary: &GlbSummary) -> Rig
   proposal.unresolved_slots = unresolved_family_slots(summary, &proposal.rig_family);
 
   if proposal.warnings.is_empty() {
-    proposal.warnings = fallback_rig_proposal(summary).warnings;
+    proposal.warnings = fallback_rig_proposal(summary, geometry_analysis).warnings;
+  } else if let Some(note) = geometry_note(geometry_analysis, &proposal.rig_family) {
+    if !proposal.warnings.iter().any(|warning| warning == &note) {
+      proposal.warnings.push(note);
+    }
   }
 
   proposal.rigging_needed = proposal.rigging_needed || summary.rig_diagnostics.rigging_needed;
   proposal
 }
 
-fn fallback_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -> RigUpgradePlan {
+fn fallback_rig_upgrade_plan(
+  summary: &GlbSummary,
+  proposal: &RigProposal,
+  geometry_analysis: Option<&GeometryAnalysis>,
+) -> RigUpgradePlan {
   let diagnostics = &summary.rig_diagnostics;
-  let rig_family = normalize_rig_family(&proposal.rig_family);
+  let (rig_family, geometry_confidence) = geometry_guided_rig_family(summary, geometry_analysis, &proposal.rig_family);
   let canonical_slots = if proposal.canonical_slots.is_empty() {
     canonical_slots_for_family(&rig_family)
   } else {
@@ -956,12 +1073,16 @@ fn fallback_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -> Ri
     warnings.push("This upgrade path still needs a future mesh-binding phase before the asset can be considered fully auto-rigged.".to_string());
   }
 
+  if let Some(note) = geometry_note(geometry_analysis, &rig_family) {
+    warnings.push(note);
+  }
+
   RigUpgradePlan {
     source: "fallback".to_string(),
     rig_family: rig_family.clone(),
     canonical_slots,
     readiness,
-    confidence: proposal.confidence.clamp(0.0, 1.0),
+    confidence: proposal.confidence.max(geometry_confidence).clamp(0.0, 1.0),
     rationale,
     target_rig_type: format!("canonical-{rig_family}"),
     apply_strategy,
@@ -978,13 +1099,27 @@ fn fallback_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -> Ri
   }
 }
 
-fn sanitize_rig_upgrade_plan(mut plan: RigUpgradePlan, summary: &GlbSummary, proposal: &RigProposal) -> RigUpgradePlan {
+fn sanitize_rig_upgrade_plan(
+  mut plan: RigUpgradePlan,
+  summary: &GlbSummary,
+  proposal: &RigProposal,
+  geometry_analysis: Option<&GeometryAnalysis>,
+) -> RigUpgradePlan {
+  let (guided_family, geometry_confidence) = geometry_guided_rig_family(
+    summary,
+    geometry_analysis,
+    if plan.rig_family.trim().is_empty() {
+      &proposal.rig_family
+    } else {
+      &plan.rig_family
+    },
+  );
   plan.rig_family = normalize_rig_family(if plan.rig_family.trim().is_empty() {
-    &proposal.rig_family
+    &guided_family
   } else {
     &plan.rig_family
   });
-  plan.confidence = plan.confidence.clamp(0.0, 1.0);
+  plan.confidence = plan.confidence.max(geometry_confidence).clamp(0.0, 1.0);
 
   if plan.source.trim().is_empty() {
     plan.source = "fallback".to_string();
@@ -995,7 +1130,7 @@ fn sanitize_rig_upgrade_plan(mut plan: RigUpgradePlan, summary: &GlbSummary, pro
   }
 
   if plan.apply_strategy.trim().is_empty() {
-    plan.apply_strategy = fallback_rig_upgrade_plan(summary, proposal).apply_strategy;
+    plan.apply_strategy = fallback_rig_upgrade_plan(summary, proposal, geometry_analysis).apply_strategy;
   }
 
   if plan.rationale.trim().is_empty() {
@@ -1003,7 +1138,7 @@ fn sanitize_rig_upgrade_plan(mut plan: RigUpgradePlan, summary: &GlbSummary, pro
   }
 
   if plan.chain_plans.is_empty() {
-    plan.chain_plans = fallback_rig_upgrade_plan(summary, proposal).chain_plans;
+    plan.chain_plans = fallback_rig_upgrade_plan(summary, proposal, geometry_analysis).chain_plans;
   }
 
   if plan.canonical_slots.is_empty() {
@@ -1019,7 +1154,13 @@ fn sanitize_rig_upgrade_plan(mut plan: RigUpgradePlan, summary: &GlbSummary, pro
   }
 
   if plan.recommended_steps.is_empty() {
-    plan.recommended_steps = fallback_rig_upgrade_plan(summary, proposal).recommended_steps;
+    plan.recommended_steps = fallback_rig_upgrade_plan(summary, proposal, geometry_analysis).recommended_steps;
+  }
+
+  if let Some(note) = geometry_note(geometry_analysis, &plan.rig_family) {
+    if !plan.warnings.iter().any(|warning| warning == &note) {
+      plan.warnings.push(note);
+    }
   }
 
   plan
@@ -1505,7 +1646,10 @@ async fn openai_recipe(prompt: &str, summary: &GlbSummary) -> Result<Option<Anim
   Ok(Some(sanitized))
 }
 
-async fn openai_rig_proposal(summary: &GlbSummary) -> Result<Option<RigProposal>, String> {
+async fn openai_rig_proposal(
+  summary: &GlbSummary,
+  geometry_analysis: Option<&GeometryAnalysis>,
+) -> Result<Option<RigProposal>, String> {
   let api_key = match env::var("OPENAI_API_KEY") {
     Ok(value) if !value.trim().is_empty() => value,
     _ => return Ok(None),
@@ -1524,9 +1668,10 @@ async fn openai_rig_proposal(summary: &GlbSummary) -> Result<Option<RigProposal>
       {
         "role": "user",
         "content": format!(
-          "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nReturn a cautious rigging proposal that preserves the detected family shape. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps. The canonicalSlots field should match the target family rather than defaulting to humanoid slots.",
+          "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nGeometry analysis: {}\n\nReturn a cautious rigging proposal that preserves the detected family shape. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps. The canonicalSlots field should match the target family rather than defaulting to humanoid slots. Treat geometry clues as authoritative when naming is weak or misleading.",
           serde_json::to_string(summary).map_err(|error| error.to_string())?,
-          serde_json::to_string(&summary.rig_diagnostics).map_err(|error| error.to_string())?
+          serde_json::to_string(&summary.rig_diagnostics).map_err(|error| error.to_string())?,
+          serde_json::to_string(&geometry_analysis).map_err(|error| error.to_string())?
         )
       }
     ]
@@ -1559,10 +1704,14 @@ async fn openai_rig_proposal(summary: &GlbSummary) -> Result<Option<RigProposal>
   let mut proposal = serde_json::from_str::<RigProposal>(content)
     .map_err(|error| format!("OpenAI returned invalid JSON for a rig proposal: {error}"))?;
   proposal.source = "openai".to_string();
-  Ok(Some(sanitize_rig_proposal(proposal, summary)))
+  Ok(Some(sanitize_rig_proposal(proposal, summary, geometry_analysis)))
 }
 
-async fn openai_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -> Result<Option<RigUpgradePlan>, String> {
+async fn openai_rig_upgrade_plan(
+  summary: &GlbSummary,
+  proposal: &RigProposal,
+  geometry_analysis: Option<&GeometryAnalysis>,
+) -> Result<Option<RigUpgradePlan>, String> {
   let api_key = match env::var("OPENAI_API_KEY") {
     Ok(value) if !value.trim().is_empty() => value,
     _ => return Ok(None),
@@ -1581,9 +1730,10 @@ async fn openai_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -
       {
         "role": "user",
         "content": format!(
-          "Model summary: {}\n\nRig proposal: {}\n\nBuild a non-destructive rig upgrade plan that preserves the asset's detected family. Prefer preserving existing rig structure when it exists. If the asset is unrigged, plan for canonical family-appropriate skeleton creation plus later weight generation. targetRigType should be family-specific, for example canonical-quadruped or canonical-arachnid when appropriate.",
+          "Model summary: {}\n\nRig proposal: {}\n\nGeometry analysis: {}\n\nBuild a non-destructive rig upgrade plan that preserves the asset's detected family. Prefer preserving existing rig structure when it exists. If the asset is unrigged, plan for canonical family-appropriate skeleton creation plus later weight generation. targetRigType should be family-specific, for example canonical-quadruped or canonical-arachnid when appropriate. Use the geometry analysis to disambiguate family choice, body orientation, and limb layout when naming is sparse.",
           serde_json::to_string(summary).map_err(|error| error.to_string())?,
-          serde_json::to_string(proposal).map_err(|error| error.to_string())?
+          serde_json::to_string(proposal).map_err(|error| error.to_string())?,
+          serde_json::to_string(&geometry_analysis).map_err(|error| error.to_string())?
         )
       }
     ]
@@ -1616,7 +1766,7 @@ async fn openai_rig_upgrade_plan(summary: &GlbSummary, proposal: &RigProposal) -
   let mut plan = serde_json::from_str::<RigUpgradePlan>(content)
     .map_err(|error| format!("OpenAI returned invalid JSON for a rig upgrade plan: {error}"))?;
   plan.source = "openai".to_string();
-  Ok(Some(sanitize_rig_upgrade_plan(plan, summary, proposal)))
+  Ok(Some(sanitize_rig_upgrade_plan(plan, summary, proposal, geometry_analysis)))
 }
 
 #[tauri::command]
@@ -1748,24 +1898,24 @@ async fn generate_animation_recipe(input: GenerateAnimationInput) -> Result<Anim
 
 #[tauri::command]
 async fn generate_rig_proposal(input: GenerateRigProposalInput) -> Result<RigProposal, String> {
-  match openai_rig_proposal(&input.summary).await {
+  match openai_rig_proposal(&input.summary, input.geometry_analysis.as_ref()).await {
     Ok(Some(proposal)) => Ok(proposal),
-    Ok(None) => Ok(fallback_rig_proposal(&input.summary)),
+    Ok(None) => Ok(fallback_rig_proposal(&input.summary, input.geometry_analysis.as_ref())),
     Err(error) => {
       log::warn!("OpenAI rig proposal generation failed, using fallback proposal: {error}");
-      Ok(fallback_rig_proposal(&input.summary))
+      Ok(fallback_rig_proposal(&input.summary, input.geometry_analysis.as_ref()))
     }
   }
 }
 
 #[tauri::command]
 async fn generate_rig_upgrade_plan(input: GenerateRigUpgradeInput) -> Result<RigUpgradePlan, String> {
-  match openai_rig_upgrade_plan(&input.summary, &input.proposal).await {
+  match openai_rig_upgrade_plan(&input.summary, &input.proposal, input.geometry_analysis.as_ref()).await {
     Ok(Some(plan)) => Ok(plan),
-    Ok(None) => Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal)),
+    Ok(None) => Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal, input.geometry_analysis.as_ref())),
     Err(error) => {
       log::warn!("OpenAI rig upgrade generation failed, using fallback plan: {error}");
-      Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal))
+      Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal, input.geometry_analysis.as_ref()))
     }
   }
 }
