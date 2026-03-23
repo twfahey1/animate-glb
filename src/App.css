@@ -485,6 +485,29 @@
   gap: 10px;
 }
 
+.animation-source-list {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0 0;
+  display: grid;
+  gap: 10px;
+}
+
+.animation-source-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.animation-source-button {
+  height: 100%;
+}
+
+.animation-source-action {
+  white-space: nowrap;
+}
+
 .saved-clip-button {
   width: 100%;
   text-align: left;
@@ -571,6 +594,10 @@
   }
 
   .rig-diagnostics-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .animation-source-item {
     grid-template-columns: 1fr;
   }
 }

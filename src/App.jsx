@@ -80,6 +80,14 @@ function buildBrowserSummary(file) {
   }
 }
 
+function baseModelFilePath(filePath) {
+  return String(filePath || '').split('#')[0]
+}
+
+function modelFileMatches(leftFilePath, rightFilePath) {
+  return baseModelFilePath(leftFilePath) === baseModelFilePath(rightFilePath)
+}
+
 function visibleItems(items, isExpanded, previewCount = 12) {
   if (!items?.length) {
     return []
@@ -521,6 +529,11 @@ function buildRiggedExportBaseName(fileName) {
   return `${slugifyFileToken(baseName, 'model')}-rigged-upgrade`
 }
 
+function buildWorkingCopyFileName(fileName) {
+  const baseName = fileName?.replace(/\.[^.]+$/, '') || 'model'
+  return `${slugifyFileToken(baseName, 'model')}-rigged-working-copy.glb`
+}
+
 function replaceFileExtension(filePath, nextExtension) {
   if (!filePath) {
     return nextExtension
@@ -602,6 +615,33 @@ function buildLocalRigProposal(summary, source = 'client-fallback', geometryAnal
     unresolvedSlots,
     recommendedActions,
     warnings,
+  }
+}
+
+function buildWorkingCopyRigProposal(summary, activePlan) {
+  const diagnostics = summary?.rigDiagnostics ?? {}
+  const rigFamily = normalizeRigFamily(activePlan?.rigFamily ?? diagnostics.detectedRigFamily)
+  const canonicalSlots = activePlan?.canonicalSlots?.length
+    ? activePlan.canonicalSlots
+    : canonicalSlotsForFamily(rigFamily)
+  const proposedRigProfile = summary?.rigProfile ?? {}
+  const unresolvedSlots = canonicalSlots.filter((slotName) => !proposedRigProfile[slotName])
+
+  return {
+    source: 'working-copy',
+    rigFamily,
+    canonicalSlots,
+    riggingNeeded: false,
+    confidence: 1,
+    readiness: 'ready',
+    rationale: `The active scene is now a derived rigged working copy using the ${formatRigFamily(rigFamily).toLowerCase()} upgrade plan. Continue generating motion against this promoted asset, then save it explicitly when you want a new GLB on disk.`,
+    proposedRigProfile,
+    unresolvedSlots,
+    recommendedActions: [
+      'Generate motion against the promoted working copy instead of the original raw source asset.',
+      'Use Save rigged working copy to persist the promoted rig without overwriting the source file.',
+    ],
+    warnings: ['The original source file is unchanged until you explicitly save this rigged working copy.'],
   }
 }
 
@@ -720,6 +760,21 @@ function plannedJointSlots(rigUpgradePlan) {
   return orderedSlots
 }
 
+function buildExportStatusMessage(targetLabel, exportPayload) {
+  const totalCount = exportPayload?.exportAnimationCount ?? 0
+  const sourceCount = exportPayload?.sourceAnimationCount ?? 0
+  const includedGeneratedCount = exportPayload?.includedRecipeNames?.length ?? 0
+  const skippedNames = exportPayload?.skippedRecipeNames ?? []
+  const exportedSummary = `Exported ${totalCount} animation${totalCount === 1 ? '' : 's'} to ${targetLabel}.`
+  const compositionSummary = ` Included ${sourceCount} source clip${sourceCount === 1 ? '' : 's'} and ${includedGeneratedCount} saved or generated clip${includedGeneratedCount === 1 ? '' : 's'}.`
+
+  if (!skippedNames.length) {
+    return `${exportedSummary}${compositionSummary}`
+  }
+
+  return `${exportedSummary}${compositionSummary} Skipped ${skippedNames.length} clip${skippedNames.length === 1 ? '' : 's'} with no playable targets: ${skippedNames.join(', ')}.`
+}
+
 function App() {
   const browserInputRef = useRef(null)
   const browserObjectUrlRef = useRef('')
@@ -750,6 +805,11 @@ function App() {
   const [isGeneratingRigUpgrade, setIsGeneratingRigUpgrade] = useState(false)
   const [isAnalyzingGeometry, setIsAnalyzingGeometry] = useState(false)
   const [isApplyingRigUpgrade, setIsApplyingRigUpgrade] = useState(false)
+  const [isActivatingRigWorkingCopy, setIsActivatingRigWorkingCopy] = useState(false)
+  const [isSavingWorkingCopy, setIsSavingWorkingCopy] = useState(false)
+  const [isRigWorkingCopyActive, setIsRigWorkingCopyActive] = useState(false)
+  const [sourceAnimationPreviewName, setSourceAnimationPreviewName] = useState('')
+  const [removingSourceAnimationName, setRemovingSourceAnimationName] = useState('')
 
   useEffect(() => {
     return () => {
@@ -783,8 +843,12 @@ function App() {
   }, [isTauriRuntime])
 
   const filteredSavedClips = summary
-    ? savedClips.filter((clip) => clip.modelFilePath === summary.filePath)
+    ? savedClips.filter((clip) => modelFileMatches(clip.modelFilePath, summary.filePath))
     : []
+  const exportRecipes = filteredSavedClips.map((clip) => clip.recipe)
+  if (recipe && !activeSavedClipId) {
+    exportRecipes.unshift(recipe)
+  }
   const canCarryEmbeddedClipsIntoRigExport =
     Boolean(summary?.animationCount) && rigUpgradePlan?.applyStrategy === 'preserve-and-remap'
   const canonicalJointSlots = plannedJointSlots(rigUpgradePlan)
@@ -818,6 +882,8 @@ function App() {
       setRigUpgradePlan(null)
       setGeometryAnalysis(null)
       setIsRigPreviewEnabled(false)
+      setIsRigWorkingCopyActive(false)
+      setSourceAnimationPreviewName('')
       setRecipe(null)
     })
   }
@@ -867,6 +933,8 @@ function App() {
         setRigUpgradePlan(null)
         setGeometryAnalysis(null)
         setIsRigPreviewEnabled(false)
+        setIsRigWorkingCopyActive(false)
+        setSourceAnimationPreviewName('')
         setRecipe(null)
       })
     } catch (error) {
@@ -890,6 +958,7 @@ function App() {
       if (!isTauriRuntime) {
         startTransition(() => {
           setActiveSavedClipId('')
+          setSourceAnimationPreviewName('')
           setRecipe(buildLocalRecipe(prompt))
         })
         return
@@ -904,6 +973,7 @@ function App() {
 
       startTransition(() => {
         setActiveSavedClipId('')
+        setSourceAnimationPreviewName('')
         setRecipe(nextRecipe)
       })
     } catch (error) {
@@ -940,6 +1010,7 @@ function App() {
           ...currentClips.filter((clip) => clip.id !== savedClip.id),
         ])
         setActiveSavedClipId(savedClip.id)
+        setSourceAnimationPreviewName('')
         setRecipe(savedClip.recipe)
       })
     } catch (error) {
@@ -1167,26 +1238,60 @@ function App() {
     }
   }
 
-  async function handleExportGlb() {
-    if (!summary || !recipe || !viewportRef.current) {
+  async function handleActivateRigWorkingCopy() {
+    if (!summary || !rigProposal || !viewportRef.current) {
       return
     }
 
     setErrorMessage('')
-    setIsExportingGlb(true)
+    setIsActivatingRigWorkingCopy(true)
 
     try {
-      const exportPayload = await viewportRef.current.exportRecipeGlb(recipe)
-      const suggestedName = buildExportFileName(summary.fileName, recipe.name || exportPayload.defaultFileName)
+      const activePlan = rigUpgradePlan ?? buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis)
+      const resolvedGeometryAnalysis = geometryAnalysis ?? (await viewportRef.current.analyzeRigGeometry())
+      const activationResult = await viewportRef.current.activateRigWorkingCopy(
+        activePlan,
+        resolvedGeometryAnalysis,
+        recipe,
+        rigProposal?.proposedRigProfile,
+        {
+          includeEmbeddedSourceClips: includeEmbeddedClipsInRigExport,
+        },
+      )
+      const nextSummary = activationResult.workingSummary
+
+      startTransition(() => {
+        setSummary(nextSummary)
+        setGeometryAnalysis(activationResult.geometryAnalysis)
+        setRigProposal(buildWorkingCopyRigProposal(nextSummary, activePlan))
+        setRigUpgradePlan(null)
+        setIsRigPreviewEnabled(false)
+        setIsRigWorkingCopyActive(true)
+        setActiveSavedClipId('')
+        setSourceAnimationPreviewName('')
+        setRecipe(activationResult.workingRecipe ?? null)
+      })
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error, 'Unable to promote a rigged working copy for this model.'))
+    } finally {
+      setIsActivatingRigWorkingCopy(false)
+    }
+  }
+
+  async function handleSaveWorkingCopyGlb() {
+    if (!summary || !viewportRef.current) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsSavingWorkingCopy(true)
+
+    try {
+      const exportPayload = await viewportRef.current.exportCurrentSourceGlb()
+      const suggestedName = summary.fileName || buildWorkingCopyFileName(exportPayload.defaultFileName)
 
       if (!isTauriRuntime) {
-        const blob = new Blob([Uint8Array.from(exportPayload.bytes)], { type: 'model/gltf-binary' })
-        const downloadUrl = URL.createObjectURL(blob)
-        const link = document.createElement('a')
-        link.href = downloadUrl
-        link.download = suggestedName
-        link.click()
-        URL.revokeObjectURL(downloadUrl)
+        downloadBytes(exportPayload.bytes, suggestedName, 'model/gltf-binary')
         setViewerStatus(`Downloaded ${suggestedName}.`)
         return
       }
@@ -1210,7 +1315,55 @@ function App() {
         bytes: exportPayload.bytes,
       })
 
-      setViewerStatus(`Exported ${recipe.name} to ${targetPath}.`)
+      setViewerStatus(`Saved ${targetPath}.`)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error, 'Unable to save the current rigged working copy.'))
+    } finally {
+      setIsSavingWorkingCopy(false)
+    }
+  }
+
+  async function handleExportGlb() {
+    if (!summary || !viewportRef.current) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsExportingGlb(true)
+
+    try {
+      const exportPayload = await viewportRef.current.exportAnimationBundle(exportRecipes)
+      const defaultExportLabel = exportRecipes.length > 1 || (summary.animationCount ?? 0) > 0
+        ? 'animation-bundle'
+        : exportRecipes[0]?.name || exportPayload.defaultFileName
+      const suggestedName = buildExportFileName(summary.fileName, defaultExportLabel)
+
+      if (!isTauriRuntime) {
+        downloadBytes(exportPayload.bytes, suggestedName, 'model/gltf-binary')
+        setViewerStatus(buildExportStatusMessage(suggestedName, exportPayload))
+        return
+      }
+
+      const targetPath = await saveFileDialog({
+        defaultPath: suggestedName,
+        filters: [
+          {
+            name: 'GLB model',
+            extensions: ['glb'],
+          },
+        ],
+      })
+
+      if (!targetPath || Array.isArray(targetPath)) {
+        return
+      }
+
+      await invoke('write_binary_file', {
+        filePath: targetPath,
+        bytes: exportPayload.bytes,
+      })
+
+      setViewerStatus(buildExportStatusMessage(targetPath, exportPayload))
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : 'Unable to export the current GLB.')
     } finally {
@@ -1218,9 +1371,53 @@ function App() {
     }
   }
 
+  function handlePreviewSourceAnimation(animationName) {
+    startTransition(() => {
+      setActiveSavedClipId('')
+      setSourceAnimationPreviewName(animationName)
+      setRecipe(null)
+    })
+  }
+
+  async function handleRemoveSourceAnimation(animationName) {
+    if (!summary || !viewportRef.current) {
+      return
+    }
+
+    setErrorMessage('')
+    setRemovingSourceAnimationName(animationName)
+
+    try {
+      const nextPreviewName = sourceAnimationPreviewName === animationName ? '' : sourceAnimationPreviewName
+      const result = await viewportRef.current.removeSourceAnimation(animationName, {
+        previewAnimationName: nextPreviewName,
+      })
+
+      startTransition(() => {
+        setSummary((currentSummary) => {
+          if (!currentSummary) {
+            return currentSummary
+          }
+
+          return {
+            ...currentSummary,
+            animationCount: result.animationCount,
+            animationNames: result.animationNames,
+          }
+        })
+        setSourceAnimationPreviewName(result.previewAnimationName || '')
+      })
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error, 'Unable to remove that source animation from the current file.'))
+    } finally {
+      setRemovingSourceAnimationName('')
+    }
+  }
+
   function handlePlaySavedClip(savedClip) {
     startTransition(() => {
       setActiveSavedClipId(savedClip.id)
+      setSourceAnimationPreviewName('')
       setPrompt(savedClip.prompt)
       setRecipe(savedClip.recipe)
     })
@@ -1284,6 +1481,7 @@ function App() {
             rigPreviewEnabled={isRigPreviewEnabled}
             rigPreviewPlan={rigUpgradePlan}
             rigProfile={rigProposal?.proposedRigProfile}
+            sourceAnimationPreviewName={sourceAnimationPreviewName}
             onStatusChange={setViewerStatus}
           />
 
@@ -1320,6 +1518,21 @@ function App() {
                 <strong>{summary ? formatBytes(summary.sizeBytes) : '0 B'}</strong>
               </article>
             </div>
+
+            {isRigWorkingCopyActive ? (
+              <div className="metadata-expanded-card">
+                <div className="metadata-expanded-header">
+                  <div>
+                    <p className="label">Source</p>
+                    <h3>Active rigged working copy</h3>
+                  </div>
+                  <span className="pill">Promoted in session</span>
+                </div>
+                <p className="metadata-note">
+                  The viewport is currently driven by a derived rigged working copy. Prompt generation and GLB export now target this promoted asset until you load a different model.
+                </p>
+              </div>
+            ) : null}
 
             <dl className="metadata-list">
               <div>
@@ -1816,6 +2029,20 @@ function App() {
                       This creates a derived rigged GLB and a sidecar rig package. It does not overwrite the original source file.
                     </span>
                   </div>
+
+                  <div className="clip-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={handleActivateRigWorkingCopy}
+                      disabled={!rigProposal || isActivatingRigWorkingCopy}
+                    >
+                      {isActivatingRigWorkingCopy ? 'Promoting rig…' : 'Promote rigged working copy'}
+                    </button>
+                    <span className="clip-actions-note">
+                      Replace the active preview source with the derived rigged result so later prompts and exports operate on the promoted asset instead of the raw source.
+                    </span>
+                  </div>
                 </div>
               ) : null}
             </div>
@@ -1895,14 +2122,24 @@ function App() {
                   className="secondary-button"
                   type="button"
                   onClick={handleExportGlb}
-                  disabled={!summary || !recipe || isExportingGlb}
+                  disabled={!summary || isExportingGlb}
                 >
                   {isExportingGlb ? 'Saving GLB…' : 'Save GLB with animations'}
+                </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleSaveWorkingCopyGlb}
+                  disabled={!summary || !isRigWorkingCopyActive || isSavingWorkingCopy}
+                >
+                  {isSavingWorkingCopy ? 'Saving working copy…' : 'Save rigged working copy'}
                 </button>
                 <span className="clip-actions-note">
                   {activeSavedClipId
                     ? 'Saved clip selected for playback.'
-                    : 'Save this result locally or export a new GLB with the generated clip embedded as a native animation for other tools.'}
+                    : isRigWorkingCopyActive
+                      ? `Export now bundles the current source animation set plus ${exportRecipes.length} saved or generated clip${exportRecipes.length === 1 ? '' : 's'} into one GLB.`
+                      : `Export now bundles the current file animation set plus ${exportRecipes.length} saved or generated clip${exportRecipes.length === 1 ? '' : 's'} into one GLB.`}
                 </span>
               </div>
 
@@ -1914,6 +2151,50 @@ function App() {
                   </li>
                 ))}
               </ul>
+            </div>
+
+            <div className="saved-clips-card">
+              <div className="recipe-headline">
+                <div>
+                  <p className="label">File animations</p>
+                  <h3>Embedded and working-copy clips</h3>
+                </div>
+                <span className="duration-badge">{summary?.animationCount ?? 0}</span>
+              </div>
+
+              {!summary ? (
+                <p className="recipe-rationale">Load a model to inspect animations already stored in the file.</p>
+              ) : summary.animationNames?.length ? (
+                <>
+                  <p className="recipe-rationale">
+                    Preview the animations already embedded in the current file, or remove any clip before exporting a consolidated GLB.
+                  </p>
+                  <ul className="animation-source-list">
+                    {summary.animationNames.map((animationName) => (
+                      <li className="animation-source-item" key={animationName}>
+                        <button
+                          className={`saved-clip-button animation-source-button ${!recipe && sourceAnimationPreviewName === animationName ? 'is-active' : ''}`}
+                          type="button"
+                          onClick={() => handlePreviewSourceAnimation(animationName)}
+                        >
+                          <span className="saved-clip-title">{animationName}</span>
+                          <span className="saved-clip-meta">Already embedded in the current source file</span>
+                        </button>
+                        <button
+                          className="secondary-button animation-source-action"
+                          type="button"
+                          onClick={() => handleRemoveSourceAnimation(animationName)}
+                          disabled={removingSourceAnimationName === animationName}
+                        >
+                          {removingSourceAnimationName === animationName ? 'Removing…' : 'Remove'}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : (
+                <p className="recipe-rationale">No animations are currently embedded in this file.</p>
+              )}
             </div>
 
             <div className="saved-clips-card">

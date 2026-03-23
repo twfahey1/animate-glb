@@ -240,10 +240,216 @@ function absoluteTrackValues(targetObject, binding, relativeValues) {
   return relativeValues.map((value) => baseline + value)
 }
 
-function makeClip(recipe, activeRoot) {
+function sanitizedTrackTargetName(targetObject) {
+  if (!targetObject?.name) {
+    return ''
+  }
+
+  if (typeof THREE.PropertyBinding?.sanitizeNodeName === 'function') {
+    return THREE.PropertyBinding.sanitizeNodeName(targetObject.name)
+  }
+
+  return targetObject.name
+}
+
+function makeTrackBindingPath(targetObject, binding, targetMode = 'runtime') {
+  if (targetMode === 'portable') {
+    const sanitizedName = sanitizedTrackTargetName(targetObject)
+
+    if (!sanitizedName) {
+      return binding
+    }
+
+    return `${sanitizedName}${binding}`
+  }
+
+  return `${targetObject.uuid}${binding}`
+}
+
+function ensurePortableTargetName(targetObject, activeRoot) {
+  if (!targetObject?.name && targetObject === activeRoot) {
+    targetObject.name = 'SceneRoot'
+  }
+
+  return sanitizedTrackTargetName(targetObject)
+}
+
+function collectTrackTimes(tracks) {
+  return Array.from(
+    new Set(
+      tracks.flatMap((track) => track?.times ?? []).filter((time) => Number.isFinite(time)),
+    ),
+  ).sort((left, right) => left - right)
+}
+
+function interpolateTrackValue(track, time) {
+  const times = track?.times ?? []
+  const values = track?.values ?? []
+
+  if (!times.length || !values.length) {
+    return 0
+  }
+
+  if (time <= times[0]) {
+    return values[0]
+  }
+
+  const lastIndex = times.length - 1
+
+  if (time >= times[lastIndex]) {
+    return values[lastIndex]
+  }
+
+  for (let index = 0; index < lastIndex; index += 1) {
+    const startTime = times[index]
+    const endTime = times[index + 1]
+
+    if (time === startTime) {
+      return values[index]
+    }
+
+    if (time > startTime && time < endTime) {
+      const duration = endTime - startTime
+
+      if (!Number.isFinite(duration) || duration <= 0) {
+        return values[index]
+      }
+
+      const progress = (time - startTime) / duration
+      return THREE.MathUtils.lerp(values[index], values[index + 1], progress)
+    }
+  }
+
+  return values[lastIndex]
+}
+
+function absoluteComponentValue(targetObject, property, axis, track, time) {
+  const baseline = targetObject?.[property]?.[axis]
+  const relativeValue = interpolateTrackValue(track, time)
+
+  if (!Number.isFinite(baseline)) {
+    return relativeValue
+  }
+
+  if (property === 'scale') {
+    return baseline * relativeValue
+  }
+
+  return baseline + relativeValue
+}
+
+function makePortableClip(recipe, activeRoot) {
   if (!recipe?.tracks?.length) {
     return null
   }
+
+  const groupedTracks = new Map()
+
+  for (const track of recipe.tracks) {
+    const parsedBinding = parseBinding(track.binding)
+
+    if (!parsedBinding) {
+      continue
+    }
+
+    const targetObject = findTargetObject(activeRoot, track.targetName)
+
+    if (!targetObject) {
+      continue
+    }
+
+    const targetName = ensurePortableTargetName(targetObject, activeRoot)
+
+    if (!targetName) {
+      continue
+    }
+
+    const groupKey = `${targetName}:${parsedBinding.property}`
+    const existingGroup = groupedTracks.get(groupKey) ?? {
+      axes: {},
+      property: parsedBinding.property,
+      targetName,
+      targetObject,
+    }
+    existingGroup.axes[parsedBinding.axis] = track
+    groupedTracks.set(groupKey, existingGroup)
+  }
+
+  const persistentTracks = []
+
+  for (const group of groupedTracks.values()) {
+    const times = collectTrackTimes(Object.values(group.axes))
+
+    if (!times.length) {
+      continue
+    }
+
+    if (group.property === 'rotation') {
+      const baseEuler = group.targetObject.rotation.clone()
+      const quaternionValues = []
+      const workingEuler = new THREE.Euler(0, 0, 0, baseEuler.order)
+      const workingQuaternion = new THREE.Quaternion()
+
+      for (const time of times) {
+        workingEuler.set(
+          absoluteComponentValue(group.targetObject, 'rotation', 'x', group.axes.x, time) ?? baseEuler.x,
+          absoluteComponentValue(group.targetObject, 'rotation', 'y', group.axes.y, time) ?? baseEuler.y,
+          absoluteComponentValue(group.targetObject, 'rotation', 'z', group.axes.z, time) ?? baseEuler.z,
+          baseEuler.order,
+        )
+        workingQuaternion.setFromEuler(workingEuler)
+        quaternionValues.push(
+          workingQuaternion.x,
+          workingQuaternion.y,
+          workingQuaternion.z,
+          workingQuaternion.w,
+        )
+      }
+
+      persistentTracks.push(
+        new THREE.QuaternionKeyframeTrack(
+          `${group.targetName}.quaternion`,
+          Float32Array.from(times),
+          Float32Array.from(quaternionValues),
+          THREE.InterpolateLinear,
+        ),
+      )
+      continue
+    }
+
+    const vectorValues = []
+
+    for (const time of times) {
+      vectorValues.push(
+        absoluteComponentValue(group.targetObject, group.property, 'x', group.axes.x, time),
+        absoluteComponentValue(group.targetObject, group.property, 'y', group.axes.y, time),
+        absoluteComponentValue(group.targetObject, group.property, 'z', group.axes.z, time),
+      )
+    }
+
+    persistentTracks.push(
+      new THREE.VectorKeyframeTrack(
+        `${group.targetName}.${group.property}`,
+        Float32Array.from(times),
+        Float32Array.from(vectorValues),
+        THREE.InterpolateLinear,
+      ),
+    )
+  }
+
+  if (!persistentTracks.length) {
+    return null
+  }
+
+  return new THREE.AnimationClip(recipe.name, recipe.durationSeconds, persistentTracks)
+}
+
+function makeClip(recipe, activeRoot, options = {}) {
+  if (!recipe?.tracks?.length) {
+    return null
+  }
+
+  const targetMode = options.targetMode ?? 'runtime'
 
   const tracks = recipe.tracks
     .map((track) => {
@@ -256,7 +462,7 @@ function makeClip(recipe, activeRoot) {
       const absoluteValues = absoluteTrackValues(targetObject, track.binding, track.values)
 
       return new THREE.NumberKeyframeTrack(
-        `${targetObject.uuid}${track.binding}`,
+        makeTrackBindingPath(targetObject, track.binding, targetMode),
         Float32Array.from(track.times),
         Float32Array.from(absoluteValues),
         track.interpolation === 'linear' ? THREE.InterpolateLinear : THREE.InterpolateSmooth,
@@ -316,6 +522,49 @@ function attachModel(runtime, gltf, onStatusChange, activeRootRef, embeddedAnima
 
 function cloneSceneForPlayback(scene) {
   return cloneSkeleton(scene)
+}
+
+function cloneAnimations(animations) {
+  return animations.map((animation) => animation.clone())
+}
+
+function uniqueAnimationName(name, usedNames) {
+  const baseName = String(name || 'Generated Animation').trim() || 'Generated Animation'
+
+  if (!usedNames.has(baseName)) {
+    usedNames.add(baseName)
+    return baseName
+  }
+
+  let duplicateIndex = 2
+  let candidateName = `${baseName} ${duplicateIndex}`
+
+  while (usedNames.has(candidateName)) {
+    duplicateIndex += 1
+    candidateName = `${baseName} ${duplicateIndex}`
+  }
+
+  usedNames.add(candidateName)
+  return candidateName
+}
+
+function findSourceAnimation(animations, animationName) {
+  if (!animations?.length) {
+    return null
+  }
+
+  if (!animationName) {
+    return animations[0]
+  }
+
+  const exactMatch = animations.find((animation) => animation.name === animationName)
+
+  if (exactMatch) {
+    return exactMatch
+  }
+
+  const requestedKey = normalizeLookupKey(animationName)
+  return animations.find((animation) => normalizeLookupKey(animation.name || '') === requestedKey) ?? animations[0]
 }
 
 function summarizeVector(vector) {
@@ -1575,8 +1824,115 @@ function exportGlb(scene, animations) {
   })
 }
 
+function rigProfileFromGeneratedBones(boneNames) {
+  const available = new Set(boneNames)
+  const lookup = (slotName) => (available.has(slotName) ? slotName : null)
+
+  return {
+    root: lookup('root'),
+    pelvis: lookup('pelvis'),
+    spine: lookup('spine'),
+    chest: lookup('chest'),
+    neck: lookup('neck'),
+    head: lookup('head'),
+    jaw: lookup('jaw'),
+    leftShoulder: lookup('leftShoulder'),
+    leftUpperArm: lookup('leftUpperArm'),
+    leftForearm: lookup('leftForearm'),
+    leftHand: lookup('leftHand'),
+    rightShoulder: lookup('rightShoulder'),
+    rightUpperArm: lookup('rightUpperArm'),
+    rightForearm: lookup('rightForearm'),
+    rightHand: lookup('rightHand'),
+    leftThigh: lookup('leftThigh'),
+    leftCalf: lookup('leftCalf'),
+    leftFoot: lookup('leftFoot'),
+    rightThigh: lookup('rightThigh'),
+    rightCalf: lookup('rightCalf'),
+    rightFoot: lookup('rightFoot'),
+  }
+}
+
+function collectNamedNodeNames(sourceScene) {
+  const nodeNames = []
+
+  sourceScene.traverse((node) => {
+    if (node.name) {
+      nodeNames.push(node.name)
+    }
+  })
+
+  return Array.from(new Set(nodeNames))
+}
+
+function buildWorkingSummary(
+  sourceScene,
+  animations,
+  activePlan,
+  metadata,
+  baseFilePath,
+  workingRigProfile,
+  workingTargetNodeNames,
+) {
+  const uniqueNodeNames = collectNamedNodeNames(sourceScene).slice(0, 128)
+  const animationNames = animations.map((animation, index) => animation.name || `Animation ${index + 1}`)
+  const canonicalSlotCount = activePlan?.canonicalSlots?.length ?? workingTargetNodeNames.length
+  const rigFamily = activePlan?.rigFamily ?? 'humanoid'
+  const resolvedRigSlotCount = Object.values(workingRigProfile ?? {}).filter(Boolean).length
+
+  return {
+    animationCount: animations.length,
+    animationNames,
+    fileName: `${(baseFilePath || 'model').split('/').pop()?.replace(/\.[^.]+$/, '') || 'model'}-rigged-working-copy.glb`,
+    filePath: `${baseFilePath || 'model'}#rigged-working-copy`,
+    nodeCount: uniqueNodeNames.length,
+    nodeNames: uniqueNodeNames,
+    rigDiagnostics: {
+      detectedHumanoidScore: rigFamily === 'humanoid' ? 1 : 0,
+      detectedRigFamily: rigFamily,
+      familyConfidence: 1,
+      jointCount: Math.max(metadata?.createdJointCount ?? 0, workingTargetNodeNames.length),
+      materialCount: 0,
+      meshCount: metadata?.riggedMeshCount ?? 0,
+      namedNodeCount: uniqueNodeNames.length,
+      notes: ['This is a derived rigged working copy generated in-app from the original source asset.'],
+      primitiveCount: 0,
+      resolvedRigSlotCount,
+      rigStatus: 'rigged',
+      riggingNeeded: false,
+      skinCount: metadata?.riggedMeshCount ?? 0,
+      targetableNodeCount: workingTargetNodeNames.length,
+      totalRigSlotCount: canonicalSlotCount,
+    },
+    rigProfile: workingRigProfile,
+    sceneCount: 1,
+    sceneNames: ['Rigged Working Copy'],
+    sizeBytes: 0,
+    targetNodeNames: workingTargetNodeNames,
+  }
+}
+
+function attachWorkingScene(runtime, sourceScene, animations, onStatusChange, activeRootRef, embeddedAnimationsRef) {
+  runtime.mixer.stopAllAction()
+  runtime.content.clear()
+  activeRootRef.current = null
+  embeddedAnimationsRef.current = []
+
+  const previewScene = cloneSceneForPlayback(sourceScene)
+  attachModel(
+    runtime,
+    {
+      animations: animations.map((animation) => animation.clone()),
+      scene: previewScene,
+    },
+    onStatusChange,
+    activeRootRef,
+    embeddedAnimationsRef,
+  )
+}
+
 const ModelViewport = forwardRef(function ModelViewport(
-  { geometryAnalysis, isTauriRuntime, modelFilePath, modelUrl, recipe, rigPreviewEnabled, rigPreviewPlan, rigProfile, onStatusChange },
+  { geometryAnalysis, isTauriRuntime, modelFilePath, modelUrl, recipe, rigPreviewEnabled, rigPreviewPlan, rigProfile, sourceAnimationPreviewName, onStatusChange },
   ref,
 ) {
   const stageRef = useRef(null)
@@ -1607,8 +1963,8 @@ const ModelViewport = forwardRef(function ModelViewport(
         }
 
         const exportRoot = cloneSceneForPlayback(sourceRootRef.current)
-        const exportAnimations = sourceAnimationsRef.current.map((clip) => clip.clone())
-        const generatedClip = makeClip(activeRecipe, exportRoot)
+        const exportAnimations = cloneAnimations(sourceAnimationsRef.current)
+        const generatedClip = makePortableClip(activeRecipe, exportRoot)
 
         if (!generatedClip) {
           throw new Error('The selected recipe does not contain any playable tracks to export.')
@@ -1620,6 +1976,172 @@ const ModelViewport = forwardRef(function ModelViewport(
         return {
           bytes: Array.from(new Uint8Array(glbBuffer)),
           defaultFileName: `${activeRecipe.name || 'generated-motion'}.glb`,
+        }
+      },
+      async exportCurrentSourceGlb() {
+        if (!sourceRootRef.current) {
+          throw new Error('Load or create a rigged working copy before exporting the current source GLB.')
+        }
+
+        const exportRoot = cloneSceneForPlayback(sourceRootRef.current)
+        const exportAnimations = cloneAnimations(sourceAnimationsRef.current)
+        const glbBuffer = await exportGlb(exportRoot, exportAnimations)
+
+        return {
+          bytes: Array.from(new Uint8Array(glbBuffer)),
+          defaultFileName: 'rigged-working-copy.glb',
+        }
+      },
+      async exportAnimationBundle(recipes = []) {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before exporting bundled animations.')
+        }
+
+        const exportRoot = cloneSceneForPlayback(sourceRootRef.current)
+        const exportAnimations = cloneAnimations(sourceAnimationsRef.current)
+        const usedNames = new Set(
+          exportAnimations.map((animation, index) => animation.name || `Animation ${index + 1}`),
+        )
+        const includedRecipeNames = []
+        const skippedRecipeNames = []
+
+        for (const animationRecipe of recipes) {
+          if (!animationRecipe) {
+            continue
+          }
+
+          const generatedClip = makePortableClip(animationRecipe, exportRoot)
+
+          if (!generatedClip) {
+            skippedRecipeNames.push(animationRecipe.name || 'Unnamed clip')
+            continue
+          }
+
+          generatedClip.name = uniqueAnimationName(generatedClip.name || animationRecipe.name, usedNames)
+          exportAnimations.push(generatedClip)
+          includedRecipeNames.push(generatedClip.name)
+        }
+
+        const glbBuffer = await exportGlb(exportRoot, exportAnimations)
+        return {
+          bytes: Array.from(new Uint8Array(glbBuffer)),
+          defaultFileName: 'animation-bundle.glb',
+          exportAnimationCount: exportAnimations.length,
+          includedRecipeNames,
+          skippedRecipeNames,
+          sourceAnimationCount: sourceAnimationsRef.current.length,
+        }
+      },
+      removeSourceAnimation(animationName, options = {}) {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before removing a source animation.')
+        }
+
+        const sourceAnimations = sourceAnimationsRef.current
+        const nextAnimations = sourceAnimations.filter((animation) => animation.name !== animationName)
+
+        if (nextAnimations.length === sourceAnimations.length) {
+          throw new Error(`Could not find a source animation named ${animationName}.`)
+        }
+
+        sourceAnimationsRef.current = cloneAnimations(nextAnimations)
+        embeddedAnimationsRef.current = cloneAnimations(nextAnimations)
+
+        const runtime = runtimeRef.current
+        const activeRoot = activeRootRef.current
+        const previewClip = findSourceAnimation(embeddedAnimationsRef.current, options.previewAnimationName)
+
+        if (runtime && activeRoot && !recipe) {
+          runtime.mixer.stopAllAction()
+
+          if (previewClip) {
+            const action = runtime.mixer.clipAction(previewClip, activeRoot)
+            action.reset().fadeIn(0.15).play()
+            onStatusChange(`Removed ${animationName}. Previewing ${previewClip.name || 'the next source animation'}.`)
+          } else {
+            onStatusChange(`Removed ${animationName}. No embedded animations remain in the current source.`)
+          }
+        }
+
+        return {
+          animationCount: sourceAnimationsRef.current.length,
+          animationNames: sourceAnimationsRef.current.map(
+            (animation, index) => animation.name || `Animation ${index + 1}`,
+          ),
+          previewAnimationName: previewClip?.name || '',
+        }
+      },
+      async activateRigWorkingCopy(activePlan, geometryAnalysisInput, activeRecipe, activeRigProfile, options = {}) {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before creating a rigged working copy.')
+        }
+
+        if (!activePlan) {
+          throw new Error('Generate a rig upgrade plan before creating a rigged working copy.')
+        }
+
+        const runtime = runtimeRef.current
+        const resolvedGeometryAnalysis = geometryAnalysisInput ?? analyzeSceneGeometry(sourceRootRef.current)
+        const { metadata, scene } = buildRiggedSceneFromSource(
+          sourceRootRef.current,
+          resolvedGeometryAnalysis,
+          activePlan,
+        )
+        const generatedBoneNames = createSyntheticSkeleton(
+          buildRigDefinition(resolvedGeometryAnalysis, activePlan?.rigFamily),
+        ).boneList.map((bone) => bone.name)
+        const shouldPreserveSourceRig = activePlan?.applyStrategy === 'preserve-and-remap'
+        const workingRigProfile = shouldPreserveSourceRig
+          ? { ...(activeRigProfile ?? {}) }
+          : rigProfileFromGeneratedBones(generatedBoneNames)
+        const workingTargetNodeNames = shouldPreserveSourceRig
+          ? Array.from(new Set(Object.values(workingRigProfile).filter(Boolean)))
+          : generatedBoneNames
+        const riggedRecipe = shouldPreserveSourceRig
+          ? activeRecipe
+          : retargetRecipeToRig(activeRecipe, activeRigProfile)
+        const animations = []
+
+        if (options.includeEmbeddedSourceClips && activePlan?.applyStrategy === 'preserve-and-remap') {
+          animations.push(...cloneAnimations(sourceAnimationsRef.current))
+        }
+
+        if (riggedRecipe) {
+          const generatedClip = makePortableClip(riggedRecipe, scene)
+          if (generatedClip) {
+            animations.unshift(generatedClip)
+          }
+        }
+
+        sourceRootRef.current = scene
+        sourceAnimationsRef.current = cloneAnimations(animations)
+
+        if (runtime) {
+          attachWorkingScene(
+            runtime,
+            sourceRootRef.current,
+            sourceAnimationsRef.current,
+            onStatusChange,
+            activeRootRef,
+            embeddedAnimationsRef,
+          )
+        }
+
+        return {
+          generatedBoneNames,
+          geometryAnalysis: resolvedGeometryAnalysis,
+          metadata,
+          riggedAnimationCount: sourceAnimationsRef.current.length,
+          workingRecipe: riggedRecipe,
+          workingSummary: buildWorkingSummary(
+            sourceRootRef.current,
+            sourceAnimationsRef.current,
+            activePlan,
+            metadata,
+            modelFilePath,
+            workingRigProfile,
+            workingTargetNodeNames,
+          ),
         }
       },
       async applyRigUpgradePlan(activePlan, geometryAnalysisInput, activeRecipe, activeRigProfile, options = {}) {
@@ -1637,15 +2159,18 @@ const ModelViewport = forwardRef(function ModelViewport(
           resolvedGeometryAnalysis,
           activePlan,
         )
-        const riggedRecipe = retargetRecipeToRig(activeRecipe, activeRigProfile)
+        const shouldPreserveSourceRig = activePlan?.applyStrategy === 'preserve-and-remap'
+        const riggedRecipe = shouldPreserveSourceRig
+          ? activeRecipe
+          : retargetRecipeToRig(activeRecipe, activeRigProfile)
         const animations = []
 
         if (options.includeEmbeddedSourceClips && activePlan?.applyStrategy === 'preserve-and-remap') {
-          animations.push(...sourceAnimationsRef.current.map((animation) => animation.clone()))
+          animations.push(...cloneAnimations(sourceAnimationsRef.current))
         }
 
         if (riggedRecipe) {
-          animations.push(...[makeClip(riggedRecipe, scene)].filter(Boolean))
+          animations.push(...[makePortableClip(riggedRecipe, scene)].filter(Boolean))
         }
         const glbBuffer = await exportGlb(scene, animations)
         const generatedRig = createSyntheticSkeleton(
@@ -1666,7 +2191,7 @@ const ModelViewport = forwardRef(function ModelViewport(
         }
       },
     }),
-    [],
+    [modelFilePath, onStatusChange],
   )
 
   useEffect(() => {
@@ -1813,11 +2338,11 @@ const ModelViewport = forwardRef(function ModelViewport(
             (gltf) => {
               if (!cancelled) {
                 sourceRootRef.current = gltf.scene || new THREE.Group()
-                sourceAnimationsRef.current = gltf.animations.map((animation) => animation.clone())
+                sourceAnimationsRef.current = cloneAnimations(gltf.animations)
                 const previewScene = cloneSceneForPlayback(sourceRootRef.current)
                 attachModel(
                   runtime,
-                  { ...gltf, animations: sourceAnimationsRef.current.map((animation) => animation.clone()), scene: previewScene },
+                  { ...gltf, animations: cloneAnimations(sourceAnimationsRef.current), scene: previewScene },
                   onStatusChange,
                   activeRootRef,
                   embeddedAnimationsRef,
@@ -1858,11 +2383,11 @@ const ModelViewport = forwardRef(function ModelViewport(
           return
         }
         sourceRootRef.current = gltf.scene || new THREE.Group()
-        sourceAnimationsRef.current = gltf.animations.map((animation) => animation.clone())
+          sourceAnimationsRef.current = cloneAnimations(gltf.animations)
         const previewScene = cloneSceneForPlayback(sourceRootRef.current)
         attachModel(
           runtime,
-          { ...gltf, animations: sourceAnimationsRef.current.map((animation) => animation.clone()), scene: previewScene },
+            { ...gltf, animations: cloneAnimations(sourceAnimationsRef.current), scene: previewScene },
           onStatusChange,
           activeRootRef,
           embeddedAnimationsRef,
@@ -1937,13 +2462,24 @@ const ModelViewport = forwardRef(function ModelViewport(
     runtime.mixer.stopAllAction()
 
     if (!recipe) {
-      if (embeddedAnimationsRef.current.length) {
-        const previewAction = runtime.mixer.clipAction(embeddedAnimationsRef.current[0], activeRoot)
-        previewAction.reset().fadeIn(0.15).play()
-        onStatusChange('Embedded animation preview restored.')
+      const previewClip = findSourceAnimation(embeddedAnimationsRef.current, sourceAnimationPreviewName)
+
+      if (!previewClip) {
+        onStatusChange('No source animations are embedded in the current file. Generate a recipe to preview motion.')
+        return undefined
       }
 
-      return undefined
+      const previewAction = runtime.mixer.clipAction(previewClip, activeRoot)
+      previewAction.reset().fadeIn(0.15).play()
+      onStatusChange(
+        sourceAnimationPreviewName
+          ? `Previewing ${previewClip.name || 'the selected source animation'}.`
+          : 'Embedded animation preview restored.',
+      )
+
+      return () => {
+        previewAction.stop()
+      }
     }
 
     const clip = makeClip(recipe, activeRoot)
@@ -1963,7 +2499,7 @@ const ModelViewport = forwardRef(function ModelViewport(
       action.stop()
       runtime.mixer.uncacheClip(clip)
     }
-  }, [recipe, onStatusChange])
+  }, [recipe, sourceAnimationPreviewName, onStatusChange])
 
   return (
     <div className="viewer-stage">

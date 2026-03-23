@@ -10,10 +10,11 @@ Desktop MVP for loading a GLB or GLTF file, previewing it in Three.js, and gener
 - Prompt form that asks the backend for a generated animation recipe
 - Node- and bone-targeted playback for prompts that imply local body motion like head turns, laughs, and pointing
 - Local clip library for saving generated recipes per source model
-- Export action that writes a new GLB with the generated clip embedded as a native animation
+- Export action that writes a new GLB with the current file animations plus saved recipes bundled together as native glTF animations
 - Rig diagnostics that classify loaded assets as rigged, partial, or unrigged
 - Rig-family detection for humanoid, quadruped, arachnid, creature, and prop-like assets
 - Rig proposal analysis with optional OpenAI assistance and a local fallback proposal path
+- Preview controls for animations already embedded in the loaded file, plus in-app removal before re-export
 - Optional OpenAI-backed recipe generation when `OPENAI_API_KEY` is present
 - Deterministic local fallback recipe generator when no AI credentials are configured
 
@@ -53,15 +54,22 @@ If the OpenAI request fails or those variables are absent, the backend automatic
 There are now two distinct save paths in the app:
 
 - `Save`: stores the current generated recipe in the local app library so it can be replayed later for the same source model.
-- `Save GLB with animations`: writes a new `.glb` file that contains the source model plus the generated clip as a native glTF animation.
+- `Save GLB with animations`: writes a new `.glb` file that contains the current source model, any animations already embedded in that file, and all saved clips for that model bundled together as native glTF animations. If there is a currently generated unsaved recipe selected, that recipe is bundled too.
 
 The exported GLB is intended for use in external tools such as Blender, game engines, and other viewers that understand glTF animations.
 
 Current export behavior:
 
 - Uses the original loaded scene, not the preview-normalized version shown in the viewport
-- Preserves existing embedded animations and appends the generated one
+- Preserves the current file animation set and appends all playable saved or generated recipes that still resolve against the active source rig
 - Exports from the Three.js scene graph via `GLTFExporter`
+- Skips saved recipes that no longer have playable targets on the active source asset, and reports skipped clip names in the viewer status
+
+Managing animations already in a file:
+
+- Load a GLB that already contains animations and preview them individually from the `Embedded and working-copy clips` panel
+- Remove any embedded or working-copy clip from the current in-memory source animation set before exporting
+- Re-export the file to persist that trimmed animation set into a new consolidated `.glb`
 
 Current limitation:
 
