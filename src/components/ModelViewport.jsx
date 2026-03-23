@@ -575,6 +575,20 @@ function summarizeVector(vector) {
   }
 }
 
+function vectorFromSummary(value) {
+  return new THREE.Vector3(
+    Number(value?.x ?? 0),
+    Number(value?.y ?? 0),
+    Number(value?.z ?? 0),
+  )
+}
+
+function cloneAnchorMapSummary(anchorMap) {
+  return Object.fromEntries(
+    Object.entries(anchorMap ?? {}).map(([slotName, value]) => [slotName, summarizeVector(vectorFromSummary(value))]),
+  )
+}
+
 function classifyMeshRegion(centerY, minY, maxY) {
   const height = Math.max(maxY - minY, 0.001)
   const normalizedY = (centerY - minY) / height
@@ -678,6 +692,7 @@ function buildGeometryClues(size, center, meshRegions, regionBuckets, axes, skin
   const depthToHeightRatio = size.z / height
   const lowMeshRatio = (regionBuckets.feet.length + regionBuckets.legs.length) / meshCount
   const feetMeshRatio = regionBuckets.feet.length / meshCount
+  const torsoMeshRatio = (regionBuckets.core.length + regionBuckets['upper-torso'].length) / meshCount
   const projectedCenter = projectHorizontalAxes(center, axes)
   const headCentroid = regionBuckets.head.length
     ? regionBuckets.head.reduce((accumulator, nextValue) => accumulator.add(nextValue), new THREE.Vector3()).multiplyScalar(1 / regionBuckets.head.length)
@@ -696,6 +711,14 @@ function buildGeometryClues(size, center, meshRegions, regionBuckets, axes, skin
         clamp01(regionBuckets.head.length / 2) * 0.15 +
         clamp01(regionBuckets['upper-torso'].length / 2) * 0.1 +
         clamp01(1 - lowMeshRatio) * 0.1,
+    ),
+    avian: clamp01(
+      clamp01((widthToHeightRatio - 0.5) / 0.8) * 0.28 +
+        clamp01((verticality - 0.7) / 0.9) * 0.18 +
+        clamp01(regionBuckets.head.length / 1.5) * 0.12 +
+        clamp01(regionBuckets.feet.length / 2) * 0.14 +
+        clamp01(torsoMeshRatio / 0.55) * 0.14 +
+        clamp01(lateralSymmetry) * 0.14,
     ),
     quadruped: clamp01(
       clamp01((horizontalAspectRatio - 1.05) / 1.35) * 0.28 +
@@ -854,10 +877,12 @@ function summarizeQuadrupedGroundContacts(clusters, centerForward, centerLateral
 
   const orderedKeys = ['frontLeft', 'frontRight', 'hindLeft', 'hindRight']
   const groupedContacts = Object.fromEntries(
-    orderedKeys.map((key) => [key, summarizeGroundContactGroup(key, groups[key])]),
+    orderedKeys
+      .map((key) => [key, summarizeGroundContactGroup(key, groups[key])])
+      .filter(([, contact]) => Boolean(contact)),
   )
 
-  const resolvedCount = orderedKeys.filter((key) => groupedContacts[key]).length
+  const resolvedCount = Object.keys(groupedContacts).length
 
   if (resolvedCount < 3) {
     return null
@@ -1051,6 +1076,10 @@ function normalizeRigFamily(rigFamily) {
 
   if (['quadruped', 'canine', 'feline', 'equine'].includes(normalized)) {
     return 'quadruped'
+  }
+
+  if (['avian', 'bird', 'raptor', 'eagle', 'hawk', 'owl'].includes(normalized)) {
+    return 'avian'
   }
 
   if (['arachnid', 'spider', 'insectoid'].includes(normalized)) {
@@ -1289,6 +1318,71 @@ function buildQuadrupedAnchorMap(geometryAnalysis) {
   }
 }
 
+function buildAvianAnchorMap(geometryAnalysis) {
+  const min = geometryAnalysis.overallBounds.min
+  const max = geometryAnalysis.overallBounds.max
+  const center = geometryAnalysis.overallBounds.center
+  const size = geometryAnalysis.overallBounds.size
+  const axes = dominantHorizontalAxes(size)
+  const projectedCenter = projectHorizontalAxes(center, axes)
+  const forwardMin = axes.forwardAxis === 'z' ? min.z : min.x
+  const forwardMax = axes.forwardAxis === 'z' ? max.z : max.x
+  const lateralCenter = projectedCenter.lateral
+  const length = Math.max(forwardMax - forwardMin, 0.22)
+  const width = Math.max(axes.lateralAxis === 'x' ? size.x : size.z, 0.18)
+  const height = Math.max(size.y, 0.18)
+  const torsoExtents = geometryAnalysis.regionExtents?.['upper-torso']
+  const feetExtents = geometryAnalysis.regionExtents?.feet
+  const headExtents = geometryAnalysis.regionExtents?.head
+  const headLandmark = geometryAnalysis.regionLandmarks?.head
+  const torsoLandmark = geometryAnalysis.regionLandmarks?.['upper-torso']
+  const coreLandmark = geometryAnalysis.regionLandmarks?.core
+  const legsLandmark = geometryAnalysis.regionLandmarks?.legs
+  const feetLandmark = geometryAnalysis.regionLandmarks?.feet
+  const pelvisY = coreLandmark?.y ?? min.y + height * 0.46
+  const chestY = torsoLandmark?.y ?? min.y + height * 0.7
+  const neckY = headLandmark?.y ?? min.y + height * 0.82
+  const headY = headLandmark?.y ?? min.y + height * 0.92
+  const footY = feetLandmark?.y ?? min.y + height * 0.04
+  const wingShoulderSpread = Math.max(width * 0.22, 0.06)
+  const wingReach = Math.max(width * 0.52, 0.12)
+  const wingTipReach = Math.max(width * 0.92, 0.2)
+  const legSpread = Math.max(width * 0.1, 0.03)
+  const headFront = pickRegionPoint(headExtents, 'front', null)?.forward ?? projectedCenter.forward + length * 0.42
+  const torsoFront = pickRegionPoint(torsoExtents, 'front', null)?.forward ?? projectedCenter.forward + length * 0.08
+  const tailBack = pickRegionPoint(feetExtents, 'back', null)?.forward ?? projectedCenter.forward - length * 0.34
+  const leftWingBase = pickRegionPoint(torsoExtents, 'left', null)?.lateral ?? lateralCenter - wingShoulderSpread
+  const rightWingBase = pickRegionPoint(torsoExtents, 'right', null)?.lateral ?? lateralCenter + wingShoulderSpread
+  const leftLegLateral = pickRegionPoint(feetExtents, 'left', null)?.lateral ?? lateralCenter - legSpread
+  const rightLegLateral = pickRegionPoint(feetExtents, 'right', null)?.lateral ?? lateralCenter + legSpread
+
+  return {
+    root: makeHorizontalPoint(center, axes, lateralCenter, footY, projectedCenter.forward),
+    pelvis: makeHorizontalPoint(center, axes, coreLandmark?.x ?? lateralCenter, pelvisY, projectedCenter.forward - length * 0.08),
+    spineLower: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, min.y + height * 0.58, projectedCenter.forward - length * 0.02),
+    spineUpper: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, chestY, torsoFront),
+    neck: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, neckY, torsoFront + length * 0.12),
+    head: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY, headFront - length * 0.04),
+    beak: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY, headFront + length * 0.08),
+    leftWingShoulder: makeHorizontalPoint(center, axes, leftWingBase, chestY, torsoFront - length * 0.02),
+    leftWingUpper: makeHorizontalPoint(center, axes, leftWingBase - wingReach * 0.42, chestY - height * 0.02, torsoFront + length * 0.03),
+    leftWingLower: makeHorizontalPoint(center, axes, leftWingBase - wingReach * 0.76, chestY - height * 0.08, torsoFront + length * 0.07),
+    leftWingTip: makeHorizontalPoint(center, axes, Math.min(leftWingBase - wingTipReach, lateralCenter - wingTipReach), chestY - height * 0.12, torsoFront + length * 0.1),
+    rightWingShoulder: makeHorizontalPoint(center, axes, rightWingBase, chestY, torsoFront - length * 0.02),
+    rightWingUpper: makeHorizontalPoint(center, axes, rightWingBase + wingReach * 0.42, chestY - height * 0.02, torsoFront + length * 0.03),
+    rightWingLower: makeHorizontalPoint(center, axes, rightWingBase + wingReach * 0.76, chestY - height * 0.08, torsoFront + length * 0.07),
+    rightWingTip: makeHorizontalPoint(center, axes, Math.max(rightWingBase + wingTipReach, lateralCenter + wingTipReach), chestY - height * 0.12, torsoFront + length * 0.1),
+    leftLegUpper: makeHorizontalPoint(center, axes, leftLegLateral, legsLandmark?.y ?? min.y + height * 0.28, projectedCenter.forward - length * 0.02),
+    leftLegLower: makeHorizontalPoint(center, axes, leftLegLateral, min.y + height * 0.14, projectedCenter.forward + length * 0.02),
+    leftFoot: makeHorizontalPoint(center, axes, leftLegLateral, footY, projectedCenter.forward + length * 0.09),
+    rightLegUpper: makeHorizontalPoint(center, axes, rightLegLateral, legsLandmark?.y ?? min.y + height * 0.28, projectedCenter.forward - length * 0.02),
+    rightLegLower: makeHorizontalPoint(center, axes, rightLegLateral, min.y + height * 0.14, projectedCenter.forward + length * 0.02),
+    rightFoot: makeHorizontalPoint(center, axes, rightLegLateral, footY, projectedCenter.forward + length * 0.09),
+    tailBase: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.04, projectedCenter.forward - length * 0.16),
+    tailTip: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.1, tailBack),
+  }
+}
+
 function buildArachnidAnchorMap(geometryAnalysis) {
   const min = geometryAnalysis.overallBounds.min
   const max = geometryAnalysis.overallBounds.max
@@ -1379,12 +1473,83 @@ function buildGenericCreatureAnchorMap(geometryAnalysis) {
   }
 }
 
-function buildRigDefinition(geometryAnalysis, rigFamily) {
+function orderCustomBoneTree(customJoints, anchorMap, boneTree) {
+  const ordered = []
+  const knownSlots = new Set(['root', ...boneTree.map(([slotName]) => slotName)])
+  const pending = [...(customJoints ?? [])]
+
+  while (pending.length) {
+    const nextPending = []
+    let progressed = false
+
+    pending.forEach((joint) => {
+      if (!joint?.slotName || !joint?.parentSlot || !anchorMap[joint.slotName]) {
+        return
+      }
+
+      if (knownSlots.has(joint.slotName)) {
+        return
+      }
+
+      if (knownSlots.has(joint.parentSlot)) {
+        ordered.push([joint.slotName, joint.parentSlot])
+        knownSlots.add(joint.slotName)
+        progressed = true
+        return
+      }
+
+      nextPending.push(joint)
+    })
+
+    if (!progressed) {
+      break
+    }
+
+    pending.length = 0
+    pending.push(...nextPending)
+  }
+
+  return ordered
+}
+
+function buildRigDefinition(geometryAnalysis, rigFamily, customAnchorMap = null, customJoints = []) {
   const family = normalizeRigFamily(rigFamily)
+  let rigDefinition = null
 
   switch (family) {
+    case 'avian':
+      rigDefinition = {
+        anchorMap: buildAvianAnchorMap(geometryAnalysis),
+        boneTree: [
+          ['pelvis', 'root'],
+          ['spineLower', 'pelvis'],
+          ['spineUpper', 'spineLower'],
+          ['neck', 'spineUpper'],
+          ['head', 'neck'],
+          ['beak', 'head'],
+          ['leftWingShoulder', 'spineUpper'],
+          ['leftWingUpper', 'leftWingShoulder'],
+          ['leftWingLower', 'leftWingUpper'],
+          ['leftWingTip', 'leftWingLower'],
+          ['rightWingShoulder', 'spineUpper'],
+          ['rightWingUpper', 'rightWingShoulder'],
+          ['rightWingLower', 'rightWingUpper'],
+          ['rightWingTip', 'rightWingLower'],
+          ['leftLegUpper', 'pelvis'],
+          ['leftLegLower', 'leftLegUpper'],
+          ['leftFoot', 'leftLegLower'],
+          ['rightLegUpper', 'pelvis'],
+          ['rightLegLower', 'rightLegUpper'],
+          ['rightFoot', 'rightLegLower'],
+          ['tailBase', 'pelvis'],
+          ['tailTip', 'tailBase'],
+        ],
+        color: '#ffd36b',
+        family,
+      }
+      break
     case 'quadruped':
-      return {
+      rigDefinition = {
         anchorMap: buildQuadrupedAnchorMap(geometryAnalysis),
         boneTree: [
           ['pelvis', 'root'],
@@ -1415,8 +1580,9 @@ function buildRigDefinition(geometryAnalysis, rigFamily) {
         color: '#8ad7ff',
         family,
       }
+      break
     case 'arachnid':
-      return {
+      rigDefinition = {
         anchorMap: buildArachnidAnchorMap(geometryAnalysis),
         boneTree: [
           ['abdomen', 'root'],
@@ -1442,8 +1608,9 @@ function buildRigDefinition(geometryAnalysis, rigFamily) {
         color: '#e07bff',
         family,
       }
+      break
     case 'prop':
-      return {
+      rigDefinition = {
         anchorMap: buildPropAnchorMap(geometryAnalysis),
         boneTree: [
           ['body', 'root'],
@@ -1453,8 +1620,9 @@ function buildRigDefinition(geometryAnalysis, rigFamily) {
         color: '#7be0b3',
         family,
       }
+      break
     case 'generic-creature':
-      return {
+      rigDefinition = {
         anchorMap: buildGenericCreatureAnchorMap(geometryAnalysis),
         boneTree: [
           ['body', 'root'],
@@ -1470,8 +1638,9 @@ function buildRigDefinition(geometryAnalysis, rigFamily) {
         color: '#ffb261',
         family,
       }
+      break
     default:
-      return {
+      rigDefinition = {
         anchorMap: buildHumanoidAnchorMap(geometryAnalysis),
         boneTree: [
           ['pelvis', 'root'],
@@ -1498,6 +1667,26 @@ function buildRigDefinition(geometryAnalysis, rigFamily) {
         color: '#ffb261',
         family,
       }
+      break
+  }
+
+  const mergedAnchorMap = {
+    ...rigDefinition.anchorMap,
+    ...Object.fromEntries(
+      Object.entries(customAnchorMap ?? {}).map(([slotName, value]) => [slotName, vectorFromSummary(value)]),
+    ),
+  }
+
+  customJoints.forEach((joint) => {
+    if (joint?.slotName && joint?.position && !mergedAnchorMap[joint.slotName]) {
+      mergedAnchorMap[joint.slotName] = vectorFromSummary(joint.position)
+    }
+  })
+
+  return {
+    ...rigDefinition,
+    anchorMap: mergedAnchorMap,
+    boneTree: [...rigDefinition.boneTree, ...orderCustomBoneTree(customJoints, mergedAnchorMap, rigDefinition.boneTree)],
   }
 }
 
@@ -1670,6 +1859,30 @@ function chooseBoneInfluencesForVertex(vertex, rigDefinition, geometryAnalysis) 
         } else if (slotName.includes('Foot') && normalizedY < 0.16) {
           score *= 0.88
         }
+      } else if (family === 'avian') {
+        if (normalizedY > 0.48 && slotName.includes('Wing')) {
+          score *= 1.5
+        }
+
+        if (Math.abs(projectedVertex.lateral - projectedCenter.lateral) / Math.max(size.x, size.z, 0.001) > 0.18 && slotName.includes('Wing')) {
+          score *= 1.4
+        }
+
+        if (normalizedY < 0.3 && (slotName.includes('Leg') || slotName.includes('Foot'))) {
+          score *= 1.55
+        }
+
+        if (normalizedY > 0.74 && (slotName === 'head' || slotName === 'beak' || slotName === 'neck')) {
+          score *= 1.45
+        }
+
+        if (normalizedForward > 0.58 && (slotName === 'head' || slotName === 'beak' || slotName === 'neck')) {
+          score *= 1.25
+        }
+
+        if (normalizedForward < 0.42 && slotName.toLowerCase().includes('tail')) {
+          score *= 1.35
+        }
       } else if (family === 'arachnid') {
         if (normalizedY < 0.22 && slotName.toLowerCase().includes('leg')) {
           score *= 1.6
@@ -1739,7 +1952,12 @@ function buildRiggedSceneFromSource(sourceScene, geometryAnalysis, upgradePlan) 
     }
   }
 
-  const rigDefinition = buildRigDefinition(geometryAnalysis, upgradePlan?.rigFamily)
+  const rigDefinition = buildRigDefinition(
+    geometryAnalysis,
+    upgradePlan?.rigFamily,
+    upgradePlan?.customAnchorMap,
+    upgradePlan?.customJoints,
+  )
   const exportGroup = new THREE.Group()
   exportGroup.name = 'RigUpgradeResult'
   let riggedMeshCount = 0
@@ -1779,7 +1997,12 @@ function buildRiggedSceneFromSource(sourceScene, geometryAnalysis, upgradePlan) 
 }
 
 function buildRigPreviewGroup(geometryAnalysis, upgradePlan) {
-  const rigDefinition = buildRigDefinition(geometryAnalysis, upgradePlan?.rigFamily)
+  const rigDefinition = buildRigDefinition(
+    geometryAnalysis,
+    upgradePlan?.rigFamily,
+    upgradePlan?.customAnchorMap,
+    upgradePlan?.customJoints,
+  )
   const { rootBone } = createSyntheticSkeleton(rigDefinition)
   const previewGroup = new THREE.Group()
   previewGroup.name = 'RigPreviewGroup'
@@ -1795,7 +2018,58 @@ function buildRigPreviewGroup(geometryAnalysis, upgradePlan) {
   )
   previewGroup.add(skeletonHelper)
 
+  const handleMaterial = new THREE.MeshStandardMaterial({
+    color: '#ffe2a8',
+    emissive: '#ef8354',
+    emissiveIntensity: 0.5,
+    depthTest: false,
+    transparent: true,
+    opacity: 0.95,
+  })
+  const selectedMaterial = handleMaterial.clone()
+  selectedMaterial.color.set('#7be0b3')
+  selectedMaterial.emissive.set('#75d6d0')
+  const handleGeometry = new THREE.SphereGeometry(0.04, 18, 18)
+  const handlesGroup = new THREE.Group()
+  handlesGroup.name = 'RigPreviewHandles'
+
+  Object.entries(rigDefinition.anchorMap).forEach(([slotName, position]) => {
+    const handle = new THREE.Mesh(
+      handleGeometry,
+      upgradePlan?.selectedSlot === slotName ? selectedMaterial : handleMaterial,
+    )
+    handle.position.copy(position)
+    handle.name = `RigHandle:${slotName}`
+    handle.renderOrder = 10
+    handle.userData.slotName = slotName
+    handlesGroup.add(handle)
+  })
+
+  previewGroup.add(handlesGroup)
+
   return previewGroup
+}
+
+function buildRigEditDraft(geometryAnalysis, upgradePlan) {
+  const rigDefinition = buildRigDefinition(
+    geometryAnalysis,
+    upgradePlan?.rigFamily,
+    upgradePlan?.customAnchorMap,
+    upgradePlan?.customJoints,
+  )
+  const slotOrder = ['root', ...rigDefinition.boneTree.map(([slotName]) => slotName)].filter(
+    (slotName, index, values) => values.indexOf(slotName) === index,
+  )
+
+  return {
+    anchorMap: cloneAnchorMapSummary(rigDefinition.anchorMap),
+    customJoints: (upgradePlan?.customJoints ?? []).map((joint) => ({
+      ...joint,
+      position: summarizeVector(vectorFromSummary(joint.position)),
+    })),
+    rigFamily: rigDefinition.family,
+    slotOrder,
+  }
 }
 
 function exportGlb(scene, animations) {
@@ -1831,25 +2105,54 @@ function rigProfileFromGeneratedBones(boneNames) {
   return {
     root: lookup('root'),
     pelvis: lookup('pelvis'),
+    spineLower: lookup('spineLower'),
     spine: lookup('spine'),
+    spineUpper: lookup('spineUpper'),
     chest: lookup('chest'),
     neck: lookup('neck'),
     head: lookup('head'),
     jaw: lookup('jaw'),
+    beak: lookup('beak'),
     leftShoulder: lookup('leftShoulder'),
     leftUpperArm: lookup('leftUpperArm'),
     leftForearm: lookup('leftForearm'),
     leftHand: lookup('leftHand'),
+    leftWingShoulder: lookup('leftWingShoulder'),
+    leftWingUpper: lookup('leftWingUpper'),
+    leftWingLower: lookup('leftWingLower'),
+    leftWingTip: lookup('leftWingTip'),
     rightShoulder: lookup('rightShoulder'),
     rightUpperArm: lookup('rightUpperArm'),
     rightForearm: lookup('rightForearm'),
     rightHand: lookup('rightHand'),
+    rightWingShoulder: lookup('rightWingShoulder'),
+    rightWingUpper: lookup('rightWingUpper'),
+    rightWingLower: lookup('rightWingLower'),
+    rightWingTip: lookup('rightWingTip'),
     leftThigh: lookup('leftThigh'),
     leftCalf: lookup('leftCalf'),
+    leftLegUpper: lookup('leftLegUpper'),
+    leftLegLower: lookup('leftLegLower'),
     leftFoot: lookup('leftFoot'),
     rightThigh: lookup('rightThigh'),
     rightCalf: lookup('rightCalf'),
+    rightLegUpper: lookup('rightLegUpper'),
+    rightLegLower: lookup('rightLegLower'),
     rightFoot: lookup('rightFoot'),
+    tailBase: lookup('tailBase'),
+    tailTip: lookup('tailTip'),
+    frontLeftShoulder: lookup('frontLeftShoulder'),
+    frontLeftUpperLeg: lookup('frontLeftUpperLeg'),
+    frontLeftLowerLeg: lookup('frontLeftLowerLeg'),
+    frontRightShoulder: lookup('frontRightShoulder'),
+    frontRightUpperLeg: lookup('frontRightUpperLeg'),
+    frontRightLowerLeg: lookup('frontRightLowerLeg'),
+    hindLeftHip: lookup('hindLeftHip'),
+    hindLeftUpperLeg: lookup('hindLeftUpperLeg'),
+    hindLeftLowerLeg: lookup('hindLeftLowerLeg'),
+    hindRightHip: lookup('hindRightHip'),
+    hindRightUpperLeg: lookup('hindRightUpperLeg'),
+    hindRightLowerLeg: lookup('hindRightLowerLeg'),
   }
 }
 
@@ -1932,7 +2235,22 @@ function attachWorkingScene(runtime, sourceScene, animations, onStatusChange, ac
 }
 
 const ModelViewport = forwardRef(function ModelViewport(
-  { geometryAnalysis, isTauriRuntime, modelFilePath, modelUrl, recipe, rigPreviewEnabled, rigPreviewPlan, rigProfile, sourceAnimationPreviewName, onStatusChange },
+  {
+    geometryAnalysis,
+    isTauriRuntime,
+    modelFilePath,
+    modelUrl,
+    onRigDraftChange,
+    onRigSlotSelect,
+    recipe,
+    rigEditDraft,
+    rigPreviewEnabled,
+    rigPreviewPlan,
+    rigProfile,
+    selectedRigSlot,
+    sourceAnimationPreviewName,
+    onStatusChange,
+  },
   ref,
 ) {
   const stageRef = useRef(null)
@@ -1942,6 +2260,19 @@ const ModelViewport = forwardRef(function ModelViewport(
   const sourceRootRef = useRef(null)
   const sourceAnimationsRef = useRef([])
   const rigPreviewRootRef = useRef(null)
+  const rigHandleMeshesRef = useRef([])
+  const dragStateRef = useRef({ offset: new THREE.Vector3(), plane: new THREE.Plane(), slotName: '', active: false })
+  const rigEditDraftRef = useRef(rigEditDraft)
+  const rigPreviewEnabledRef = useRef(rigPreviewEnabled)
+  const onRigDraftChangeRef = useRef(onRigDraftChange)
+  const onRigSlotSelectRef = useRef(onRigSlotSelect)
+
+  useEffect(() => {
+    rigEditDraftRef.current = rigEditDraft
+    rigPreviewEnabledRef.current = rigPreviewEnabled
+    onRigDraftChangeRef.current = onRigDraftChange
+    onRigSlotSelectRef.current = onRigSlotSelect
+  }, [onRigDraftChange, onRigSlotSelect, rigEditDraft, rigPreviewEnabled])
 
   useImperativeHandle(
     ref,
@@ -1952,6 +2283,18 @@ const ModelViewport = forwardRef(function ModelViewport(
         }
 
         return analyzeSceneGeometry(sourceRootRef.current)
+      },
+      buildRigEditDraft(activePlan, geometryAnalysisInput) {
+        if (!sourceRootRef.current) {
+          throw new Error('Load a model before editing a rig draft.')
+        }
+
+        if (!activePlan) {
+          throw new Error('Generate a rig upgrade plan before editing the rig layout.')
+        }
+
+        const resolvedGeometryAnalysis = geometryAnalysisInput ?? analyzeSceneGeometry(sourceRootRef.current)
+        return buildRigEditDraft(resolvedGeometryAnalysis, activePlan)
       },
       async exportRecipeGlb(activeRecipe) {
         if (!sourceRootRef.current) {
@@ -2088,7 +2431,12 @@ const ModelViewport = forwardRef(function ModelViewport(
           activePlan,
         )
         const generatedBoneNames = createSyntheticSkeleton(
-          buildRigDefinition(resolvedGeometryAnalysis, activePlan?.rigFamily),
+          buildRigDefinition(
+            resolvedGeometryAnalysis,
+            activePlan?.rigFamily,
+            activePlan?.customAnchorMap,
+            activePlan?.customJoints,
+          ),
         ).boneList.map((bone) => bone.name)
         const shouldPreserveSourceRig = activePlan?.applyStrategy === 'preserve-and-remap'
         const workingRigProfile = shouldPreserveSourceRig
@@ -2174,7 +2522,12 @@ const ModelViewport = forwardRef(function ModelViewport(
         }
         const glbBuffer = await exportGlb(scene, animations)
         const generatedRig = createSyntheticSkeleton(
-          buildRigDefinition(resolvedGeometryAnalysis, activePlan?.rigFamily),
+          buildRigDefinition(
+            resolvedGeometryAnalysis,
+            activePlan?.rigFamily,
+            activePlan?.customAnchorMap,
+            activePlan?.customJoints,
+          ),
         )
 
         return {
@@ -2216,6 +2569,103 @@ const ModelViewport = forwardRef(function ModelViewport(
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
     controls.target.set(0, 0.75, 0)
+    const raycaster = new THREE.Raycaster()
+    const pointer = new THREE.Vector2()
+
+    function setPointerFromEvent(event) {
+      const bounds = renderer.domElement.getBoundingClientRect()
+      pointer.x = ((event.clientX - bounds.left) / bounds.width) * 2 - 1
+      pointer.y = -((event.clientY - bounds.top) / bounds.height) * 2 + 1
+      raycaster.setFromCamera(pointer, camera)
+    }
+
+    function handlePointerDown(event) {
+      if (!rigPreviewEnabledRef.current || !rigEditDraftRef.current || !rigHandleMeshesRef.current.length) {
+        return
+      }
+
+      setPointerFromEvent(event)
+      const intersections = raycaster.intersectObjects(rigHandleMeshesRef.current, false)
+      const hit = intersections[0]
+
+      if (!hit?.object?.userData?.slotName) {
+        return
+      }
+
+      const handlePosition = hit.object.getWorldPosition(new THREE.Vector3())
+      const planeNormal = camera.getWorldDirection(new THREE.Vector3())
+      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, handlePosition)
+      const planePoint = new THREE.Vector3()
+      raycaster.ray.intersectPlane(plane, planePoint)
+
+      dragStateRef.current = {
+        active: true,
+        offset: handlePosition.sub(planePoint),
+        plane,
+        slotName: hit.object.userData.slotName,
+      }
+      controls.enabled = false
+      renderer.domElement.style.cursor = 'grabbing'
+      onRigSlotSelectRef.current?.(hit.object.userData.slotName)
+    }
+
+    function handlePointerMove(event) {
+      if (!rigPreviewEnabledRef.current || !rigEditDraftRef.current) {
+        return
+      }
+
+      if (!dragStateRef.current.active) {
+        if (!rigHandleMeshesRef.current.length) {
+          return
+        }
+
+        setPointerFromEvent(event)
+        const hovered = raycaster.intersectObjects(rigHandleMeshesRef.current, false)[0]
+        renderer.domElement.style.cursor = hovered ? 'grab' : ''
+        return
+      }
+
+      setPointerFromEvent(event)
+      const planePoint = new THREE.Vector3()
+      if (!raycaster.ray.intersectPlane(dragStateRef.current.plane, planePoint)) {
+        return
+      }
+
+      const nextPosition = planePoint.add(dragStateRef.current.offset)
+      const slotName = dragStateRef.current.slotName
+      const currentDraft = rigEditDraftRef.current
+      if (!slotName || !currentDraft?.anchorMap?.[slotName]) {
+        return
+      }
+
+      const summarized = summarizeVector(nextPosition)
+      const nextDraft = {
+        ...currentDraft,
+        anchorMap: {
+          ...currentDraft.anchorMap,
+          [slotName]: summarized,
+        },
+        customJoints: (currentDraft.customJoints ?? []).map((joint) =>
+          joint.slotName === slotName ? { ...joint, position: summarized } : joint,
+        ),
+      }
+      rigEditDraftRef.current = nextDraft
+      onRigDraftChangeRef.current?.(nextDraft)
+    }
+
+    function handlePointerUp() {
+      if (!dragStateRef.current.active) {
+        return
+      }
+
+      dragStateRef.current = { offset: new THREE.Vector3(), plane: new THREE.Plane(), slotName: '', active: false }
+      controls.enabled = true
+      renderer.domElement.style.cursor = ''
+    }
+
+    renderer.domElement.addEventListener('pointerdown', handlePointerDown)
+    renderer.domElement.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerUp)
 
     const hemiLight = new THREE.HemisphereLight('#ffd8a9', '#091017', 1.8)
     scene.add(hemiLight)
@@ -2286,6 +2736,9 @@ const ModelViewport = forwardRef(function ModelViewport(
 
     return () => {
       window.removeEventListener('resize', resize)
+      window.removeEventListener('pointerup', handlePointerUp)
+      renderer.domElement.removeEventListener('pointerdown', handlePointerDown)
+      renderer.domElement.removeEventListener('pointermove', handlePointerMove)
       window.cancelAnimationFrame(runtimeRef.current?.frameHandle ?? 0)
       controls.dispose()
       disposeObject(content)
@@ -2428,6 +2881,7 @@ const ModelViewport = forwardRef(function ModelViewport(
     if (rigPreviewRootRef.current) {
       runtime.scene.remove(rigPreviewRootRef.current)
       rigPreviewRootRef.current = null
+      rigHandleMeshesRef.current = []
     }
 
     if (!rigPreviewEnabled || !sourceRootRef.current || !rigPreviewPlan) {
@@ -2436,20 +2890,26 @@ const ModelViewport = forwardRef(function ModelViewport(
 
     try {
       const resolvedGeometryAnalysis = geometryAnalysis ?? analyzeSceneGeometry(sourceRootRef.current)
-      const previewGroup = buildRigPreviewGroup(resolvedGeometryAnalysis, rigPreviewPlan)
+      const previewGroup = buildRigPreviewGroup(resolvedGeometryAnalysis, {
+        ...rigPreviewPlan,
+        selectedSlot: selectedRigSlot,
+      })
       runtime.scene.add(previewGroup)
       rigPreviewRootRef.current = previewGroup
+      rigHandleMeshesRef.current = previewGroup.getObjectByName('RigPreviewHandles')?.children ?? []
     } catch {
       rigPreviewRootRef.current = null
+      rigHandleMeshesRef.current = []
     }
 
     return () => {
       if (rigPreviewRootRef.current) {
         runtime.scene.remove(rigPreviewRootRef.current)
         rigPreviewRootRef.current = null
+        rigHandleMeshesRef.current = []
       }
     }
-  }, [geometryAnalysis, rigPreviewEnabled, rigPreviewPlan])
+  }, [geometryAnalysis, rigPreviewEnabled, rigPreviewPlan, selectedRigSlot])
 
   useEffect(() => {
     const runtime = runtimeRef.current

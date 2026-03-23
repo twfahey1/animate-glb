@@ -369,9 +369,60 @@
   font-size: 0.92rem;
 }
 
+.token-chip-button {
+  cursor: pointer;
+}
+
 .token-chip-target {
   border-color: rgba(255, 178, 97, 0.32);
   background: rgba(255, 178, 97, 0.08);
+}
+
+.editor-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rig-editor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.rig-editor-grid label,
+.rig-editor-add label {
+  display: grid;
+  gap: 6px;
+}
+
+.rig-editor-grid input,
+.rig-editor-add input,
+.rig-editor-add select {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(8, 13, 18, 0.82);
+  color: var(--text-strong);
+}
+
+.rig-editor-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 14px;
+}
+
+.rig-editor-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .toggle-row {
@@ -598,6 +649,11 @@
   }
 
   .animation-source-item {
+    grid-template-columns: 1fr;
+  }
+
+  .rig-editor-grid,
+  .rig-editor-add {
     grid-template-columns: 1fr;
   }
 }

@@ -125,6 +125,10 @@ function normalizeRigFamily(rigFamily) {
     return 'quadruped'
   }
 
+  if (['avian', 'bird', 'raptor', 'eagle', 'hawk', 'owl'].includes(normalized)) {
+    return 'avian'
+  }
+
   if (['arachnid', 'spider', 'insectoid'].includes(normalized)) {
     return 'arachnid'
   }
@@ -148,6 +152,32 @@ function formatRigFamily(rigFamily) {
 
 function canonicalSlotsForFamily(rigFamily) {
   switch (normalizeRigFamily(rigFamily)) {
+    case 'avian':
+      return [
+        'root',
+        'pelvis',
+        'spineLower',
+        'spineUpper',
+        'neck',
+        'head',
+        'beak',
+        'leftWingShoulder',
+        'leftWingUpper',
+        'leftWingLower',
+        'leftWingTip',
+        'rightWingShoulder',
+        'rightWingUpper',
+        'rightWingLower',
+        'rightWingTip',
+        'leftLegUpper',
+        'leftLegLower',
+        'leftFoot',
+        'rightLegUpper',
+        'rightLegLower',
+        'rightFoot',
+        'tailBase',
+        'tailTip',
+      ]
     case 'quadruped':
       return [
         'root',
@@ -243,6 +273,15 @@ function canonicalSlotsForFamily(rigFamily) {
 
 function familyChainPlans(rigFamily, action = 'create') {
   switch (normalizeRigFamily(rigFamily)) {
+    case 'avian':
+      return [
+        ['Spine chain', ['root', 'pelvis', 'spineLower', 'spineUpper', 'neck', 'head', 'beak']],
+        ['Left wing chain', ['leftWingShoulder', 'leftWingUpper', 'leftWingLower', 'leftWingTip']],
+        ['Right wing chain', ['rightWingShoulder', 'rightWingUpper', 'rightWingLower', 'rightWingTip']],
+        ['Left leg chain', ['leftLegUpper', 'leftLegLower', 'leftFoot']],
+        ['Right leg chain', ['rightLegUpper', 'rightLegLower', 'rightFoot']],
+        ['Tail chain', ['tailBase', 'tailTip']],
+      ].map(([name, slots]) => ({ action, existingNodes: [], name, slots }))
     case 'quadruped':
       return [
         ['Spine chain', ['root', 'pelvis', 'spineLower', 'spineUpper', 'neck', 'head']],
@@ -416,8 +455,9 @@ function formatConfidence(value) {
   return `${Math.round(value * 100)}%`
 }
 
-function buildLocalRecipe(prompt) {
+function buildLocalRecipe(prompt, rigFamily = 'humanoid') {
   const normalized = prompt.toLowerCase()
+  const normalizedRigFamily = normalizeRigFamily(rigFamily)
   const durationSeconds = normalized.includes('slow')
     ? 6
     : normalized.includes('fast') || normalized.includes('snappy')
@@ -439,6 +479,51 @@ function buildLocalRecipe(prompt) {
   ]
 
   let rationale = 'Generated a browser-mode idle loop with a simple breathing profile.'
+
+  if (
+    normalizedRigFamily === 'avian' &&
+    (normalized.includes('wing') || normalized.includes('flap') || normalized.includes('fly'))
+  ) {
+    const wingTimes = [0, durationSeconds * 0.25, durationSeconds * 0.5, durationSeconds * 0.75, durationSeconds]
+    tracks.push(
+      {
+        targetName: 'leftWingUpper',
+        binding: '.rotation[z]',
+        interpolation: 'smooth',
+        times: wingTimes,
+        values: [0.2, -0.75, 0.28, -0.68, 0.2],
+      },
+      {
+        targetName: 'leftWingLower',
+        binding: '.rotation[z]',
+        interpolation: 'smooth',
+        times: wingTimes,
+        values: [0.12, -0.52, 0.16, -0.46, 0.12],
+      },
+      {
+        targetName: 'rightWingUpper',
+        binding: '.rotation[z]',
+        interpolation: 'smooth',
+        times: wingTimes,
+        values: [-0.2, 0.75, -0.28, 0.68, -0.2],
+      },
+      {
+        targetName: 'rightWingLower',
+        binding: '.rotation[z]',
+        interpolation: 'smooth',
+        times: wingTimes,
+        values: [-0.12, 0.52, -0.16, 0.46, -0.12],
+      },
+      {
+        targetName: 'tailBase',
+        binding: '.rotation[x]',
+        interpolation: 'smooth',
+        times: [0, durationSeconds * 0.5, durationSeconds],
+        values: [0.04, -0.08, 0.04],
+      },
+    )
+    rationale = 'Added a browser-mode wing flap cycle targeting canonical avian wing joints.'
+  }
 
   if (normalized.includes('turn') || normalized.includes('spin') || normalized.includes('rotate')) {
     tracks.push({
@@ -760,6 +845,26 @@ function plannedJointSlots(rigUpgradePlan) {
   return orderedSlots
 }
 
+function buildEditableRigPlan(rigUpgradePlan, rigEditDraft) {
+  if (!rigUpgradePlan) {
+    return null
+  }
+
+  if (!rigEditDraft) {
+    return rigUpgradePlan
+  }
+
+  return {
+    ...rigUpgradePlan,
+    customAnchorMap: rigEditDraft.anchorMap ?? {},
+    customJoints: rigEditDraft.customJoints ?? [],
+  }
+}
+
+function formatCoordinateValue(value) {
+  return Number.isFinite(value) ? value.toFixed(3) : '0.000'
+}
+
 function buildExportStatusMessage(targetLabel, exportPayload) {
   const totalCount = exportPayload?.exportAnimationCount ?? 0
   const sourceCount = exportPayload?.sourceAnimationCount ?? 0
@@ -788,6 +893,10 @@ function App() {
   const [savedClips, setSavedClips] = useState([])
   const [rigProposal, setRigProposal] = useState(null)
   const [rigUpgradePlan, setRigUpgradePlan] = useState(null)
+  const [rigEditDraft, setRigEditDraft] = useState(null)
+  const [selectedRigSlot, setSelectedRigSlot] = useState('')
+  const [newRigJointName, setNewRigJointName] = useState('')
+  const [newRigJointParent, setNewRigJointParent] = useState('root')
   const [geometryAnalysis, setGeometryAnalysis] = useState(null)
   const [isRigPreviewEnabled, setIsRigPreviewEnabled] = useState(false)
   const [includeEmbeddedClipsInRigExport, setIncludeEmbeddedClipsInRigExport] = useState(false)
@@ -853,6 +962,9 @@ function App() {
     Boolean(summary?.animationCount) && rigUpgradePlan?.applyStrategy === 'preserve-and-remap'
   const canonicalJointSlots = plannedJointSlots(rigUpgradePlan)
   const detectedRigFamily = normalizeRigFamily(summary?.rigDiagnostics?.detectedRigFamily)
+  const editableRigPlan = buildEditableRigPlan(rigUpgradePlan, rigEditDraft)
+  const rigEditorSlots = Object.keys(rigEditDraft?.anchorMap ?? {})
+  const selectedRigPosition = selectedRigSlot ? rigEditDraft?.anchorMap?.[selectedRigSlot] ?? null : null
 
   function applyBrowserFile(file) {
     if (!file) {
@@ -880,6 +992,10 @@ function App() {
       setShowAllTargetNodes(false)
       setRigProposal(null)
       setRigUpgradePlan(null)
+      setRigEditDraft(null)
+      setSelectedRigSlot('')
+      setNewRigJointName('')
+      setNewRigJointParent('root')
       setGeometryAnalysis(null)
       setIsRigPreviewEnabled(false)
       setIsRigWorkingCopyActive(false)
@@ -931,6 +1047,10 @@ function App() {
         setShowAllTargetNodes(false)
         setRigProposal(null)
         setRigUpgradePlan(null)
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
+        setNewRigJointName('')
+        setNewRigJointParent('root')
         setGeometryAnalysis(null)
         setIsRigPreviewEnabled(false)
         setIsRigWorkingCopyActive(false)
@@ -956,10 +1076,11 @@ function App() {
 
     try {
       if (!isTauriRuntime) {
+        const fallbackRigFamily = rigProposal?.rigFamily ?? summary?.rigDiagnostics?.detectedRigFamily
         startTransition(() => {
           setActiveSavedClipId('')
           setSourceAnimationPreviewName('')
-          setRecipe(buildLocalRecipe(prompt))
+          setRecipe(buildLocalRecipe(prompt, fallbackRigFamily))
         })
         return
       }
@@ -1060,6 +1181,8 @@ function App() {
       startTransition(() => {
         setRigProposal(refineRigProposalWithGeometry(summary, nextProposal, nextGeometryAnalysis))
         setRigUpgradePlan(null)
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
         setIsRigPreviewEnabled(false)
       })
     } catch (error) {
@@ -1070,6 +1193,8 @@ function App() {
       startTransition(() => {
         setRigProposal(buildLocalRigProposal(summary, 'client-fallback', geometryAnalysis))
         setRigUpgradePlan(null)
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
         setIsRigPreviewEnabled(false)
       })
       setErrorMessage(resolvedMessage)
@@ -1117,7 +1242,10 @@ function App() {
       }
 
       if (!isTauriRuntime) {
-        setRigUpgradePlan(buildLocalRigUpgradePlan(summary, rigProposal, 'browser', nextGeometryAnalysis))
+        const nextPlan = buildLocalRigUpgradePlan(summary, rigProposal, 'browser', nextGeometryAnalysis)
+        setRigUpgradePlan(nextPlan)
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
         return
       }
 
@@ -1131,6 +1259,8 @@ function App() {
 
       startTransition(() => {
         setRigUpgradePlan(refineRigUpgradePlanWithGeometry(summary, rigProposal, nextPlan, nextGeometryAnalysis))
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
       })
     } catch (error) {
       const message = getErrorMessage(error, 'Unable to generate a rig upgrade plan.')
@@ -1139,6 +1269,8 @@ function App() {
         : `${message} Showing a local fallback upgrade plan instead.`
       startTransition(() => {
         setRigUpgradePlan(buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis))
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
       })
       setErrorMessage(resolvedMessage)
     } finally {
@@ -1146,8 +1278,165 @@ function App() {
     }
   }
 
+  async function handleStartRigEditing() {
+    if (!viewportRef.current || !rigUpgradePlan) {
+      return
+    }
+
+    try {
+      const draft = await viewportRef.current.buildRigEditDraft(editableRigPlan ?? rigUpgradePlan, geometryAnalysis)
+      startTransition(() => {
+        setRigEditDraft(draft)
+        setSelectedRigSlot((currentValue) => currentValue || draft.slotOrder[0] || '')
+        setNewRigJointParent(draft.slotOrder[0] || 'root')
+        setIsRigPreviewEnabled(true)
+      })
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error, 'Unable to start rig editing for this model.'))
+    }
+  }
+
+  function handleRigDraftChange(nextDraft) {
+    setRigEditDraft(nextDraft)
+  }
+
+  function handleRigSlotSelect(slotName) {
+    setSelectedRigSlot(slotName)
+    if (slotName) {
+      setNewRigJointParent(slotName)
+    }
+  }
+
+  function handleRigCoordinateChange(axis, rawValue) {
+    if (!selectedRigSlot || !rigEditDraft) {
+      return
+    }
+
+    const nextValue = Number(rawValue)
+    if (!Number.isFinite(nextValue)) {
+      return
+    }
+
+    setRigEditDraft((currentDraft) => {
+      if (!currentDraft?.anchorMap?.[selectedRigSlot]) {
+        return currentDraft
+      }
+
+      return {
+        ...currentDraft,
+        anchorMap: {
+          ...currentDraft.anchorMap,
+          [selectedRigSlot]: {
+            ...currentDraft.anchorMap[selectedRigSlot],
+            [axis]: nextValue,
+          },
+        },
+      }
+    })
+  }
+
+  function handleAddRigJoint() {
+    const slotName = newRigJointName.trim()
+    if (!slotName || !rigEditDraft) {
+      return
+    }
+
+    const parentSlot = newRigJointParent || selectedRigSlot || 'root'
+    const parentPosition = rigEditDraft.anchorMap[parentSlot] ?? rigEditDraft.anchorMap.root ?? { x: 0, y: 0, z: 0 }
+
+    if (rigEditDraft.anchorMap[slotName]) {
+      setErrorMessage(`A joint named ${slotName} already exists in this rig draft.`)
+      return
+    }
+
+    setErrorMessage('')
+    setRigEditDraft((currentDraft) => {
+      if (!currentDraft) {
+        return currentDraft
+      }
+
+      const nextPosition = {
+        x: Number((parentPosition.x + 0.08).toFixed(4)),
+        y: Number((parentPosition.y + 0.08).toFixed(4)),
+        z: Number(parentPosition.z.toFixed(4)),
+      }
+
+      return {
+        ...currentDraft,
+        anchorMap: {
+          ...currentDraft.anchorMap,
+          [slotName]: nextPosition,
+        },
+        customJoints: [
+          ...(currentDraft.customJoints ?? []),
+          {
+            parentSlot,
+            slotName,
+            position: nextPosition,
+          },
+        ],
+        slotOrder: [...(currentDraft.slotOrder ?? []), slotName],
+      }
+    })
+    setSelectedRigSlot(slotName)
+    setNewRigJointName('')
+    setIsRigPreviewEnabled(true)
+  }
+
+  function handleRemoveCustomJoint(slotName) {
+    if (!rigEditDraft?.customJoints?.some((joint) => joint.slotName === slotName)) {
+      return
+    }
+
+    setRigEditDraft((currentDraft) => {
+      if (!currentDraft) {
+        return currentDraft
+      }
+
+      const removableSlots = new Set([slotName])
+      let foundNestedSlot = true
+      while (foundNestedSlot) {
+        foundNestedSlot = false
+        ;(currentDraft.customJoints ?? []).forEach((joint) => {
+          if (removableSlots.has(joint.parentSlot) && !removableSlots.has(joint.slotName)) {
+            removableSlots.add(joint.slotName)
+            foundNestedSlot = true
+          }
+        })
+      }
+
+      const nextAnchorMap = { ...(currentDraft.anchorMap ?? {}) }
+      removableSlots.forEach((removableSlot) => {
+        delete nextAnchorMap[removableSlot]
+      })
+
+      return {
+        ...currentDraft,
+        anchorMap: nextAnchorMap,
+        customJoints: (currentDraft.customJoints ?? []).filter((joint) => !removableSlots.has(joint.slotName)),
+        slotOrder: (currentDraft.slotOrder ?? []).filter((candidate) => !removableSlots.has(candidate)),
+      }
+    })
+
+    setSelectedRigSlot((currentValue) => {
+      if (!currentValue) {
+        return currentValue
+      }
+
+      if (currentValue === slotName) {
+        return ''
+      }
+
+      return rigEditDraft?.customJoints?.some(
+        (joint) => joint.slotName === currentValue && joint.parentSlot === slotName,
+      )
+        ? ''
+        : currentValue
+    })
+  }
+
   function handleToggleRigPreview() {
-    if (!rigUpgradePlan) {
+    if (!editableRigPlan) {
       return
     }
 
@@ -1163,7 +1452,7 @@ function App() {
     setIsApplyingRigUpgrade(true)
 
     try {
-      const activePlan = rigUpgradePlan ?? buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis)
+      const activePlan = editableRigPlan ?? buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis)
       const resolvedGeometryAnalysis = geometryAnalysis ?? (await viewportRef.current.analyzeRigGeometry())
       const appliedResult = await viewportRef.current.applyRigUpgradePlan(
         activePlan,
@@ -1247,7 +1536,7 @@ function App() {
     setIsActivatingRigWorkingCopy(true)
 
     try {
-      const activePlan = rigUpgradePlan ?? buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis)
+      const activePlan = editableRigPlan ?? buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis)
       const resolvedGeometryAnalysis = geometryAnalysis ?? (await viewportRef.current.analyzeRigGeometry())
       const activationResult = await viewportRef.current.activateRigWorkingCopy(
         activePlan,
@@ -1265,6 +1554,8 @@ function App() {
         setGeometryAnalysis(activationResult.geometryAnalysis)
         setRigProposal(buildWorkingCopyRigProposal(nextSummary, activePlan))
         setRigUpgradePlan(null)
+        setRigEditDraft(null)
+        setSelectedRigSlot('')
         setIsRigPreviewEnabled(false)
         setIsRigWorkingCopyActive(true)
         setActiveSavedClipId('')
@@ -1479,8 +1770,12 @@ function App() {
             modelUrl={viewerUrl}
             recipe={recipe}
             rigPreviewEnabled={isRigPreviewEnabled}
-            rigPreviewPlan={rigUpgradePlan}
+            rigPreviewPlan={editableRigPlan}
+            rigEditDraft={rigEditDraft}
             rigProfile={rigProposal?.proposedRigProfile}
+            selectedRigSlot={selectedRigSlot}
+            onRigDraftChange={handleRigDraftChange}
+            onRigSlotSelect={handleRigSlotSelect}
             sourceAnimationPreviewName={sourceAnimationPreviewName}
             onStatusChange={setViewerStatus}
           />
@@ -1749,7 +2044,9 @@ function App() {
                     <div className="detail-block">
                       <p className="label">Ground limb clusters</p>
                       <ul className="detail-list">
-                        {Object.entries(geometryAnalysis.groundContacts.quadrupedContacts).map(([contactName, contact]) => (
+                        {Object.entries(geometryAnalysis.groundContacts.quadrupedContacts)
+                          .filter(([, contact]) => Boolean(contact))
+                          .map(([contactName, contact]) => (
                           <li key={contactName}>
                             <strong>{formatRigSlot(contactName)}</strong>: forward {contact.forward}, lateral {contact.lateral}, density {contact.totalDensity ?? contact.count}, supports {contact.supportCount ?? 1}, {contact.isSplitContact ? 'split contact' : 'single contact'}
                           </li>
@@ -1942,6 +2239,125 @@ function App() {
                       </ul>
                     </div>
                   ) : null}
+
+                  <div className="detail-block">
+                    <div className="editor-header">
+                      <div>
+                        <p className="label">Rig editor</p>
+                        <p className="metadata-note">
+                          Drag preview joints in the viewport, fine-tune coordinates here, or add custom joints before export.
+                        </p>
+                      </div>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={handleStartRigEditing}
+                      >
+                        {rigEditDraft ? 'Refresh editable rig' : 'Edit rig layout'}
+                      </button>
+                    </div>
+
+                    {rigEditDraft ? (
+                      <>
+                        <div className="token-list">
+                          {rigEditorSlots.map((slotName) => (
+                            <button
+                              className={`token-chip token-chip-button${selectedRigSlot === slotName ? ' token-chip-target' : ''}`}
+                              key={slotName}
+                              type="button"
+                              onClick={() => handleRigSlotSelect(slotName)}
+                            >
+                              {formatRigSlot(slotName)}
+                            </button>
+                          ))}
+                        </div>
+
+                        {selectedRigPosition ? (
+                          <div className="rig-editor-grid">
+                            <label>
+                              <span className="label">X</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                value={formatCoordinateValue(selectedRigPosition.x)}
+                                onChange={(event) => handleRigCoordinateChange('x', event.target.value)}
+                              />
+                            </label>
+                            <label>
+                              <span className="label">Y</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                value={formatCoordinateValue(selectedRigPosition.y)}
+                                onChange={(event) => handleRigCoordinateChange('y', event.target.value)}
+                              />
+                            </label>
+                            <label>
+                              <span className="label">Z</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                value={formatCoordinateValue(selectedRigPosition.z)}
+                                onChange={(event) => handleRigCoordinateChange('z', event.target.value)}
+                              />
+                            </label>
+                          </div>
+                        ) : null}
+
+                        <div className="rig-editor-add">
+                          <label>
+                            <span className="label">New joint</span>
+                            <input
+                              type="text"
+                              value={newRigJointName}
+                              onChange={(event) => setNewRigJointName(event.target.value)}
+                              placeholder="leftWingFeatherTip"
+                            />
+                          </label>
+                          <label>
+                            <span className="label">Parent</span>
+                            <select
+                              value={newRigJointParent}
+                              onChange={(event) => setNewRigJointParent(event.target.value)}
+                            >
+                              {rigEditorSlots.map((slotName) => (
+                                <option key={slotName} value={slotName}>
+                                  {formatRigSlot(slotName)}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            onClick={handleAddRigJoint}
+                            disabled={!newRigJointName.trim()}
+                          >
+                            Add joint
+                          </button>
+                        </div>
+
+                        {rigEditDraft.customJoints?.length ? (
+                          <ul className="detail-list">
+                            {rigEditDraft.customJoints.map((joint) => (
+                              <li key={joint.slotName} className="rig-editor-row">
+                                <span>
+                                  <strong>{formatRigSlot(joint.slotName)}</strong> attached to {formatRigSlot(joint.parentSlot)}
+                                </span>
+                                <button
+                                  className="secondary-button"
+                                  type="button"
+                                  onClick={() => handleRemoveCustomJoint(joint.slotName)}
+                                >
+                                  Remove
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </div>
 
                   {rigUpgradePlan.newJointSlots?.length ? (
                     <div className="detail-block">
