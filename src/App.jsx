@@ -279,6 +279,107 @@ function familyChainPlans(rigFamily, action = 'create') {
   }
 }
 
+function pickRigFamilyFromGeometry(summary, geometryAnalysis, fallbackFamily) {
+  const normalizedFallback = normalizeRigFamily(fallbackFamily)
+  const geometryFamily = normalizeRigFamily(geometryAnalysis?.geometryClues?.candidateRigFamily)
+  const geometryConfidence = Number(geometryAnalysis?.geometryClues?.familyConfidence ?? 0)
+  const summaryConfidence = Number(summary?.rigDiagnostics?.familyConfidence ?? 0)
+
+  if (!geometryAnalysis?.geometryClues?.candidateRigFamily) {
+    return normalizedFallback
+  }
+
+  if (geometryConfidence >= Math.max(0.62, summaryConfidence + 0.08)) {
+    return geometryFamily
+  }
+
+  if (summaryConfidence < 0.45 && geometryConfidence >= 0.5) {
+    return geometryFamily
+  }
+
+  return normalizedFallback
+}
+
+function geometryClueNote(geometryAnalysis, rigFamily) {
+  if (!geometryAnalysis?.geometryClues) {
+    return ''
+  }
+
+  const { posture, familyConfidence } = geometryAnalysis.geometryClues
+  return `Geometry clues suggest a ${posture} ${formatRigFamily(rigFamily).toLowerCase()} body plan (${formatConfidence(familyConfidence)} confidence).`
+}
+
+function refineRigProposalWithGeometry(summary, proposal, geometryAnalysis) {
+  if (!proposal) {
+    return proposal
+  }
+
+  const rigFamily = pickRigFamilyFromGeometry(summary, geometryAnalysis, proposal.rigFamily)
+  const geometryNote = geometryClueNote(geometryAnalysis, rigFamily)
+  const geometryConfidence = Number(geometryAnalysis?.geometryClues?.familyConfidence ?? 0)
+  const canonicalSlots = canonicalSlotsForFamily(rigFamily)
+  const nextProposal = {
+    ...proposal,
+    canonicalSlots,
+    confidence: Math.max(Number(proposal.confidence ?? 0), geometryConfidence),
+    rigFamily,
+    unresolvedSlots: canonicalSlots.filter((slotName) => !proposal?.proposedRigProfile?.[slotName]),
+  }
+
+  if (geometryNote && rigFamily !== normalizeRigFamily(proposal.rigFamily)) {
+    nextProposal.rationale = `${proposal.rationale} ${geometryNote}`
+    nextProposal.warnings = Array.from(
+      new Set([
+        ...(proposal.warnings ?? []),
+        `Geometry analysis overrode the initial family guess to ${formatRigFamily(rigFamily)}.`,
+      ]),
+    )
+  }
+
+  return nextProposal
+}
+
+function refineRigUpgradePlanWithGeometry(summary, proposal, plan, geometryAnalysis) {
+  if (!plan) {
+    return plan
+  }
+
+  const rigFamily = pickRigFamilyFromGeometry(summary, geometryAnalysis, plan.rigFamily ?? proposal?.rigFamily)
+  const canonicalSlots = canonicalSlotsForFamily(rigFamily)
+  const chainAction =
+    plan.applyStrategy === 'preserve-and-remap'
+      ? 'preserve'
+      : plan.applyStrategy === 'hybrid-remap-and-add'
+        ? 'hybrid'
+        : 'create'
+  const nextPlan = {
+    ...plan,
+    canonicalSlots,
+    chainPlans: familyChainPlans(rigFamily, chainAction).map((chainPlan) => ({
+      ...chainPlan,
+      existingNodes: chainPlan.slots.map((slotName) => proposal?.proposedRigProfile?.[slotName]).filter(Boolean),
+    })),
+    confidence: Math.max(Number(plan.confidence ?? 0), Number(geometryAnalysis?.geometryClues?.familyConfidence ?? 0)),
+    newJointSlots: canonicalSlots.filter((slotName) => !proposal?.proposedRigProfile?.[slotName]),
+    preservedJointSlots: canonicalSlots.filter((slotName) => Boolean(proposal?.proposedRigProfile?.[slotName])),
+    rigFamily,
+    targetRigType: `canonical-${rigFamily}`,
+  }
+
+  if (rigFamily !== normalizeRigFamily(plan.rigFamily)) {
+    const geometryNote = geometryClueNote(geometryAnalysis, rigFamily)
+    nextPlan.rationale = `${plan.rationale} ${geometryNote}`
+    nextPlan.warnings = Array.from(
+      new Set([
+        ...(plan.warnings ?? []),
+        `Geometry analysis adjusted the upgrade target to ${formatRigFamily(rigFamily)}.`,
+      ]),
+    )
+  }
+
+  return nextPlan
+}
+
 function formatRigStatus(status) {
   if (!status) {
     return 'Unknown'
@@ -446,10 +547,10 @@ function downloadBytes(bytes, fileName, mimeType) {
   URL.revokeObjectURL(downloadUrl)
 }
 
-function buildLocalRigProposal(summary, source = 'client-fallback') {
+function buildLocalRigProposal(summary, source = 'client-fallback', geometryAnalysis = null) {
   const diagnostics = summary?.rigDiagnostics ?? {}
   const rigProfile = summary?.rigProfile ?? {}
-  const rigFamily = normalizeRigFamily(diagnostics.detectedRigFamily)
+  const rigFamily = pickRigFamilyFromGeometry(summary, geometryAnalysis, diagnostics.detectedRigFamily)
   const canonicalSlots = canonicalSlotsForFamily(rigFamily)
   const unresolvedSlots = canonicalSlots.filter((slotName) => !rigProfile[slotName])
 
@@ -480,6 +581,11 @@ function buildLocalRigProposal(summary, source = 'client-fallback') {
     recommendedActions.push('Review the rig health panel to confirm whether the asset needs a new skeleton or just better naming.')
   }
 
+  const geometryNote = geometryClueNote(geometryAnalysis, rigFamily)
+  if (geometryNote) {
+    rationale = `${rationale} ${geometryNote}`
+  }
+
   if (!warnings.length) {
     warnings.push('This proposal was generated locally from the loaded summary and may be less specific than the Rust-side analysis path.')
   }
@@ -499,9 +605,13 @@ function buildLocalRigProposal(summary, source = 'client-fallback') {
   }
 }
 
-function buildLocalRigUpgradePlan(summary, proposal, source = 'client-fallback') {
+function buildLocalRigUpgradePlan(summary, proposal, source = 'client-fallback', geometryAnalysis = null) {
   const rigProfile = proposal?.proposedRigProfile ?? summary?.rigProfile ?? {}
-  const rigFamily = normalizeRigFamily(proposal?.rigFamily ?? summary?.rigDiagnostics?.detectedRigFamily)
+  const rigFamily = pickRigFamilyFromGeometry(
+    summary,
+    geometryAnalysis,
+    proposal?.rigFamily ?? summary?.rigDiagnostics?.detectedRigFamily,
+  )
   const canonicalSlots = proposal?.canonicalSlots?.length
     ? proposal.canonicalSlots
     : canonicalSlotsForFamily(rigFamily)
@@ -564,6 +674,9 @@ function buildLocalRigUpgradePlan(summary, proposal, source = 'client-fallback')
     ],
     warnings: [
       'This is a non-destructive rig upgrade plan, not an applied rigging pass.',
+      ...(geometryClueNote(geometryAnalysis, rigFamily)
+        ? [`Geometry-guided planning is active for the detected ${formatRigFamily(rigFamily).toLowerCase()} body plan.`]
+        : []),
       ...(proposal?.warnings ?? []),
     ],
   }
@@ -847,7 +960,7 @@ function App() {
     try {
       if (!isTauriRuntime) {
         setRigProposal({
-          ...buildLocalRigProposal(summary, 'browser'),
+          ...buildLocalRigProposal(summary, 'browser', geometryAnalysis),
           readiness: 'browser-limited',
           rationale:
             'Rig proposal generation requires the Rust desktop path because browser mode does not run the deeper rig diagnostics pipeline.',
@@ -857,6 +970,15 @@ function App() {
         return
       }
 
+      let nextGeometryAnalysis = geometryAnalysis
+
+      if (!nextGeometryAnalysis && viewportRef.current) {
+        nextGeometryAnalysis = await viewportRef.current.analyzeRigGeometry()
+        startTransition(() => {
+          setGeometryAnalysis(nextGeometryAnalysis)
+        })
+      }
+
       const nextProposal = await invoke('generate_rig_proposal', {
         input: {
           summary,
@@ -864,7 +986,7 @@ function App() {
       })
 
       startTransition(() => {
-        setRigProposal(nextProposal)
+        setRigProposal(refineRigProposalWithGeometry(summary, nextProposal, nextGeometryAnalysis))
         setRigUpgradePlan(null)
         setIsRigPreviewEnabled(false)
       })
@@ -874,7 +996,7 @@ function App() {
         ? 'The running desktop app does not include the new rigging command yet. Restart npm run tauri:dev and try Analyze rigging again. Showing a local fallback rig proposal instead.'
         : `${message} Showing a local fallback rig proposal instead.`
       startTransition(() => {
-        setRigProposal(buildLocalRigProposal(summary))
+        setRigProposal(buildLocalRigProposal(summary, 'client-fallback', geometryAnalysis))
         setRigUpgradePlan(null)
         setIsRigPreviewEnabled(false)
       })
@@ -923,7 +1045,7 @@ function App() {
       }
 
       if (!isTauriRuntime) {
-        setRigUpgradePlan(buildLocalRigUpgradePlan(summary, rigProposal, 'browser'))
+        setRigUpgradePlan(buildLocalRigUpgradePlan(summary, rigProposal, 'browser', nextGeometryAnalysis))
         return
       }
 
@@ -935,7 +1057,7 @@ function App() {
       })
 
       startTransition(() => {
-        setRigUpgradePlan(nextPlan)
+        setRigUpgradePlan(refineRigUpgradePlanWithGeometry(summary, rigProposal, nextPlan, nextGeometryAnalysis))
       })
     } catch (error) {
       const message = getErrorMessage(error, 'Unable to generate a rig upgrade plan.')
@@ -943,7 +1065,7 @@ function App() {
         ? 'The running desktop app does not include the new rig upgrade command yet. Restart npm run tauri:dev and try again. Showing a local fallback upgrade plan instead.'
         : `${message} Showing a local fallback upgrade plan instead.`
       startTransition(() => {
-        setRigUpgradePlan(buildLocalRigUpgradePlan(summary, rigProposal))
+        setRigUpgradePlan(buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis))
       })
       setErrorMessage(resolvedMessage)
     } finally {
@@ -968,7 +1090,7 @@ function App() {
     setIsApplyingRigUpgrade(true)
 
     try {
-      const activePlan = rigUpgradePlan ?? buildLocalRigUpgradePlan(summary, rigProposal)
+      const activePlan = rigUpgradePlan ?? buildLocalRigUpgradePlan(summary, rigProposal, 'client-fallback', geometryAnalysis)
       const resolvedGeometryAnalysis = geometryAnalysis ?? (await viewportRef.current.analyzeRigGeometry())
       const appliedResult = await viewportRef.current.applyRigUpgradePlan(
         activePlan,
@@ -1383,7 +1505,31 @@ function App() {
                     <dt>Width</dt>
                     <dd>{geometryAnalysis?.overallBounds?.size?.x ?? 0}</dd>
                   </div>
+                  <div>
+                    <dt>Posture</dt>
+                    <dd>{geometryAnalysis?.geometryClues?.posture ?? 'Unknown'}</dd>
+                  </div>
+                  <div>
+                    <dt>Geometry family</dt>
+                    <dd>
+                      {geometryAnalysis?.geometryClues?.candidateRigFamily
+                        ? `${formatRigFamily(geometryAnalysis.geometryClues.candidateRigFamily)} (${formatConfidence(geometryAnalysis.geometryClues.familyConfidence)})`
+                        : 'Unknown'}
+                    </dd>
+                  </div>
                 </div>
+                  {geometryAnalysis?.geometryClues?.familyScores ? (
+                    <div className="detail-block">
+                      <p className="label">Geometry family scores</p>
+                      <div className="token-list">
+                        {Object.entries(geometryAnalysis.geometryClues.familyScores).map(([familyName, value]) => (
+                          <span className="token-chip" key={familyName}>
+                            {formatRigFamily(familyName)} {formatConfidence(value)}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 {geometryAnalysis.meshRegions?.length ? (
                   <ul className="detail-list">
                     {geometryAnalysis.meshRegions.map((meshRegion) => (

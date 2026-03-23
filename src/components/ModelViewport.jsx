@@ -349,6 +349,156 @@ function classifyMeshRegion(centerY, minY, maxY) {
   return 'feet'
 }
 
+function clamp01(value) {
+  return THREE.MathUtils.clamp(value, 0, 1)
+}
+
+function summarizeProjectedPoint(point, axes) {
+  return {
+    ...summarizeVector(point),
+    forward: Number(projectHorizontalAxes(point, axes).forward.toFixed(4)),
+    lateral: Number(projectHorizontalAxes(point, axes).lateral.toFixed(4)),
+  }
+}
+
+function buildRegionExtentSummary(points, axes) {
+  if (!points.length) {
+    return null
+  }
+
+  const centroid = points.reduce((accumulator, nextValue) => accumulator.add(nextValue), new THREE.Vector3())
+  centroid.multiplyScalar(1 / points.length)
+
+  let left = points[0]
+  let right = points[0]
+  let front = points[0]
+  let back = points[0]
+  let top = points[0]
+  let bottom = points[0]
+
+  points.forEach((point) => {
+    const projectedPoint = projectHorizontalAxes(point, axes)
+    const projectedLeft = projectHorizontalAxes(left, axes)
+    const projectedRight = projectHorizontalAxes(right, axes)
+    const projectedFront = projectHorizontalAxes(front, axes)
+    const projectedBack = projectHorizontalAxes(back, axes)
+
+    if (projectedPoint.lateral < projectedLeft.lateral) {
+      left = point
+    }
+
+    if (projectedPoint.lateral > projectedRight.lateral) {
+      right = point
+    }
+
+    if (projectedPoint.forward > projectedFront.forward) {
+      front = point
+    }
+
+    if (projectedPoint.forward < projectedBack.forward) {
+      back = point
+    }
+
+    if (point.y > top.y) {
+      top = point
+    }
+
+    if (point.y < bottom.y) {
+      bottom = point
+    }
+  })
+
+  return {
+    back: summarizeProjectedPoint(back, axes),
+    bottom: summarizeProjectedPoint(bottom, axes),
+    centroid: summarizeProjectedPoint(centroid, axes),
+    front: summarizeProjectedPoint(front, axes),
+    left: summarizeProjectedPoint(left, axes),
+    right: summarizeProjectedPoint(right, axes),
+    top: summarizeProjectedPoint(top, axes),
+  }
+}
+
+function buildGeometryClues(size, center, meshRegions, regionBuckets, axes, skinnedMeshCount) {
+  const meshCount = Math.max(meshRegions.length, 1)
+  const longestHorizontal = Math.max(size.x, size.z, 0.001)
+  const height = Math.max(size.y, 0.001)
+  const verticality = size.y / longestHorizontal
+  const horizontalAspectRatio = longestHorizontal / height
+  const widthToHeightRatio = size.x / height
+  const depthToHeightRatio = size.z / height
+  const lowMeshRatio = (regionBuckets.feet.length + regionBuckets.legs.length) / meshCount
+  const feetMeshRatio = regionBuckets.feet.length / meshCount
+  const projectedCenter = projectHorizontalAxes(center, axes)
+  const headCentroid = regionBuckets.head.length
+    ? regionBuckets.head.reduce((accumulator, nextValue) => accumulator.add(nextValue), new THREE.Vector3()).multiplyScalar(1 / regionBuckets.head.length)
+    : null
+  const headForwardBias = headCentroid
+    ? (projectHorizontalAxes(headCentroid, axes).forward - projectedCenter.forward) / longestHorizontal
+    : 0
+  const leftMeshCount = meshRegions.filter((meshRegion) => meshRegion.center[axes.lateralAxis] < center[axes.lateralAxis]).length
+  const rightMeshCount = meshRegions.filter((meshRegion) => meshRegion.center[axes.lateralAxis] >= center[axes.lateralAxis]).length
+  const lateralSymmetry = clamp01(1 - Math.abs(leftMeshCount - rightMeshCount) / meshCount)
+  const posture = verticality > 1.2 ? 'upright' : horizontalAspectRatio > 1.25 ? 'horizontal' : 'compact'
+  const familyScores = {
+    humanoid: clamp01(
+      clamp01((verticality - 0.75) / 1.1) * 0.45 +
+        lateralSymmetry * 0.2 +
+        clamp01(regionBuckets.head.length / 2) * 0.15 +
+        clamp01(regionBuckets['upper-torso'].length / 2) * 0.1 +
+        clamp01(1 - lowMeshRatio) * 0.1,
+    ),
+    quadruped: clamp01(
+      clamp01((horizontalAspectRatio - 1.05) / 1.35) * 0.28 +
+        clamp01(lowMeshRatio / 0.6) * 0.24 +
+        clamp01(headForwardBias / 0.22) * 0.22 +
+        clamp01(regionBuckets.feet.length / 3) * 0.14 +
+        clamp01(lateralSymmetry) * 0.12,
+    ),
+    arachnid: clamp01(
+      clamp01((Math.max(widthToHeightRatio, depthToHeightRatio) - 1.2) / 1.5) * 0.24 +
+        clamp01((horizontalAspectRatio - 1.1) / 1.5) * 0.18 +
+        clamp01(lowMeshRatio / 0.75) * 0.22 +
+        clamp01(meshCount / 8) * 0.18 +
+        clamp01(feetMeshRatio / 0.55) * 0.18,
+    ),
+    prop: clamp01(
+      (meshCount <= 3 ? 0.34 : 0.08) +
+        (skinnedMeshCount === 0 ? 0.18 : 0.04) +
+        clamp01(1 - lateralSymmetry) * 0.16 +
+        clamp01(1 - regionBuckets.head.length / 2) * 0.16 +
+        clamp01(1 - lowMeshRatio) * 0.16,
+    ),
+    'generic-creature': clamp01(
+      0.34 +
+        clamp01((horizontalAspectRatio - 0.95) / 1.8) * 0.12 +
+        clamp01(lowMeshRatio / 0.7) * 0.16 +
+        clamp01(meshCount / 6) * 0.12,
+    ),
+  }
+  const familyCandidates = Object.entries(familyScores).sort((left, right) => right[1] - left[1])
+  const [candidateRigFamily, familyConfidence] = familyCandidates[0] ?? ['generic-creature', 0.35]
+
+  return {
+    candidateRigFamily,
+    dominantForwardAxis: axes.forwardAxis,
+    familyConfidence: Number(familyConfidence.toFixed(4)),
+    familyScores: Object.fromEntries(
+      Object.entries(familyScores).map(([familyName, value]) => [familyName, Number(value.toFixed(4))]),
+    ),
+    headForwardBias: Number(headForwardBias.toFixed(4)),
+    horizontalAspectRatio: Number(horizontalAspectRatio.toFixed(4)),
+    lateralSymmetry: Number(lateralSymmetry.toFixed(4)),
+    lowMeshRatio: Number(lowMeshRatio.toFixed(4)),
+    posture,
+    widthToHeightRatio: Number(widthToHeightRatio.toFixed(4)),
+  }
+}
+
+function pickRegionPoint(regionExtent, pointName, fallbackValue) {
+  return regionExtent?.[pointName] ?? fallbackValue
+}
+
 function analyzeSceneGeometry(scene) {
   scene.updateMatrixWorld(true)
   const overallBox = new THREE.Box3().setFromObject(scene)
@@ -359,6 +509,7 @@ function analyzeSceneGeometry(scene) {
 
   const size = overallBox.getSize(new THREE.Vector3())
   const center = overallBox.getCenter(new THREE.Vector3())
+  const axes = dominantHorizontalAxes(size)
   const meshRegions = []
   const regionBuckets = {
     core: [],
@@ -422,6 +573,12 @@ function analyzeSceneGeometry(scene) {
         return [regionName, summarizeVector(average)]
       }),
   )
+  const regionExtents = Object.fromEntries(
+    Object.entries(regionBuckets)
+      .filter(([, values]) => values.length)
+      .map(([regionName, values]) => [regionName, buildRegionExtentSummary(values, axes)]),
+  )
+  const geometryClues = buildGeometryClues(size, center, meshRegions, regionBuckets, axes, skinnedMeshCount)
 
   return {
     bodyBands: {
@@ -441,6 +598,8 @@ function analyzeSceneGeometry(scene) {
       size: summarizeVector(size),
     },
     regionLandmarks,
+    regionExtents,
+    geometryClues,
     skinnedMeshCount,
     triangleCount: Number(triangleCount.toFixed(0)),
   }
@@ -509,6 +668,9 @@ function buildHumanoidAnchorMap(geometryAnalysis) {
   const min = geometryAnalysis.overallBounds.min
   const center = geometryAnalysis.overallBounds.center
   const size = geometryAnalysis.overallBounds.size
+  const torsoExtents = geometryAnalysis.regionExtents?.['upper-torso']
+  const legsExtents = geometryAnalysis.regionExtents?.legs
+  const feetExtents = geometryAnalysis.regionExtents?.feet
   const width = Math.max(size.x, 0.2)
   const depth = Math.max(size.z, 0.15)
   const height = Math.max(size.y, 0.2)
@@ -526,6 +688,10 @@ function buildHumanoidAnchorMap(geometryAnalysis) {
   const feetLandmark = geometryAnalysis.regionLandmarks?.feet
   const landmarkCenterX = torsoLandmark?.x ?? coreLandmark?.x ?? center.x
   const landmarkCenterZ = torsoLandmark?.z ?? coreLandmark?.z ?? center.z
+  const leftShoulderX = torsoExtents?.left?.x ?? landmarkCenterX - shoulderSpread
+  const rightShoulderX = torsoExtents?.right?.x ?? landmarkCenterX + shoulderSpread
+  const leftLegX = legsExtents?.left?.x ?? feetExtents?.left?.x ?? landmarkCenterX - legSpread
+  const rightLegX = legsExtents?.right?.x ?? feetExtents?.right?.x ?? landmarkCenterX + legSpread
 
   return {
     root: new THREE.Vector3(landmarkCenterX, feetLandmark?.y ?? min.y + height * 0.04, landmarkCenterZ),
@@ -535,20 +701,20 @@ function buildHumanoidAnchorMap(geometryAnalysis) {
     neck: new THREE.Vector3(headLandmark?.x ?? landmarkCenterX, headLandmark?.y ?? neckY, headLandmark?.z ?? landmarkCenterZ),
     head: new THREE.Vector3(headLandmark?.x ?? landmarkCenterX, headLandmark?.y ?? headY, headLandmark?.z ?? landmarkCenterZ),
     jaw: new THREE.Vector3(headLandmark?.x ?? landmarkCenterX, (headLandmark?.y ?? min.y + height * 0.965), (headLandmark?.z ?? landmarkCenterZ) + depth * 0.08),
-    leftShoulder: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - shoulderSpread, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
-    leftUpperArm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - width * 0.32, (torsoLandmark?.y ?? chestY) - height * 0.015, torsoLandmark?.z ?? landmarkCenterZ),
-    leftForearm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - width * 0.47, (torsoLandmark?.y ?? chestY) - height * 0.035, torsoLandmark?.z ?? landmarkCenterZ),
-    leftHand: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) - armReach, (torsoLandmark?.y ?? chestY) - height * 0.05, torsoLandmark?.z ?? landmarkCenterZ),
-    rightShoulder: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + shoulderSpread, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
-    rightUpperArm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + width * 0.32, (torsoLandmark?.y ?? chestY) - height * 0.015, torsoLandmark?.z ?? landmarkCenterZ),
-    rightForearm: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + width * 0.47, (torsoLandmark?.y ?? chestY) - height * 0.035, torsoLandmark?.z ?? landmarkCenterZ),
-    rightHand: new THREE.Vector3((torsoLandmark?.x ?? landmarkCenterX) + armReach, (torsoLandmark?.y ?? chestY) - height * 0.05, torsoLandmark?.z ?? landmarkCenterZ),
-    leftThigh: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) - legSpread, legsLandmark?.y ?? min.y + height * 0.36, legsLandmark?.z ?? landmarkCenterZ),
-    leftCalf: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) - legSpread, (legsLandmark?.y ?? min.y + height * 0.18) - height * 0.16, legsLandmark?.z ?? landmarkCenterZ),
-    leftFoot: new THREE.Vector3((feetLandmark?.x ?? landmarkCenterX) - legSpread, feetLandmark?.y ?? min.y + height * 0.03, (feetLandmark?.z ?? landmarkCenterZ) + depth * 0.12),
-    rightThigh: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) + legSpread, legsLandmark?.y ?? min.y + height * 0.36, legsLandmark?.z ?? landmarkCenterZ),
-    rightCalf: new THREE.Vector3((legsLandmark?.x ?? landmarkCenterX) + legSpread, (legsLandmark?.y ?? min.y + height * 0.18) - height * 0.16, legsLandmark?.z ?? landmarkCenterZ),
-    rightFoot: new THREE.Vector3((feetLandmark?.x ?? landmarkCenterX) + legSpread, feetLandmark?.y ?? min.y + height * 0.03, (feetLandmark?.z ?? landmarkCenterZ) + depth * 0.12),
+    leftShoulder: new THREE.Vector3(leftShoulderX, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
+    leftUpperArm: new THREE.Vector3(leftShoulderX - width * 0.14, (torsoLandmark?.y ?? chestY) - height * 0.015, torsoLandmark?.z ?? landmarkCenterZ),
+    leftForearm: new THREE.Vector3(leftShoulderX - width * 0.29, (torsoLandmark?.y ?? chestY) - height * 0.035, torsoLandmark?.z ?? landmarkCenterZ),
+    leftHand: new THREE.Vector3(Math.min(leftShoulderX - width * 0.41, landmarkCenterX - armReach), (torsoLandmark?.y ?? chestY) - height * 0.05, torsoLandmark?.z ?? landmarkCenterZ),
+    rightShoulder: new THREE.Vector3(rightShoulderX, torsoLandmark?.y ?? chestY, torsoLandmark?.z ?? landmarkCenterZ),
+    rightUpperArm: new THREE.Vector3(rightShoulderX + width * 0.14, (torsoLandmark?.y ?? chestY) - height * 0.015, torsoLandmark?.z ?? landmarkCenterZ),
+    rightForearm: new THREE.Vector3(rightShoulderX + width * 0.29, (torsoLandmark?.y ?? chestY) - height * 0.035, torsoLandmark?.z ?? landmarkCenterZ),
+    rightHand: new THREE.Vector3(Math.max(rightShoulderX + width * 0.41, landmarkCenterX + armReach), (torsoLandmark?.y ?? chestY) - height * 0.05, torsoLandmark?.z ?? landmarkCenterZ),
+    leftThigh: new THREE.Vector3(leftLegX, legsLandmark?.y ?? min.y + height * 0.36, legsLandmark?.z ?? landmarkCenterZ),
+    leftCalf: new THREE.Vector3(leftLegX, (legsLandmark?.y ?? min.y + height * 0.18) - height * 0.16, legsLandmark?.z ?? landmarkCenterZ),
+    leftFoot: new THREE.Vector3(feetExtents?.left?.x ?? leftLegX, feetLandmark?.y ?? min.y + height * 0.03, (feetLandmark?.z ?? landmarkCenterZ) + depth * 0.12),
+    rightThigh: new THREE.Vector3(rightLegX, legsLandmark?.y ?? min.y + height * 0.36, legsLandmark?.z ?? landmarkCenterZ),
+    rightCalf: new THREE.Vector3(rightLegX, (legsLandmark?.y ?? min.y + height * 0.18) - height * 0.16, legsLandmark?.z ?? landmarkCenterZ),
+    rightFoot: new THREE.Vector3(feetExtents?.right?.x ?? rightLegX, feetLandmark?.y ?? min.y + height * 0.03, (feetLandmark?.z ?? landmarkCenterZ) + depth * 0.12),
   }
 }
 
@@ -565,6 +731,10 @@ function buildQuadrupedAnchorMap(geometryAnalysis) {
   const length = Math.max(forwardMax - forwardMin, 0.3)
   const width = Math.max(axes.lateralAxis === 'x' ? size.x : size.z, 0.2)
   const height = Math.max(size.y, 0.2)
+  const torsoExtents = geometryAnalysis.regionExtents?.['upper-torso']
+  const legsExtents = geometryAnalysis.regionExtents?.legs
+  const feetExtents = geometryAnalysis.regionExtents?.feet
+  const headExtents = geometryAnalysis.regionExtents?.head
   const headLandmark = geometryAnalysis.regionLandmarks?.head
   const torsoLandmark = geometryAnalysis.regionLandmarks?.['upper-torso']
   const coreLandmark = geometryAnalysis.regionLandmarks?.core
@@ -579,33 +749,41 @@ function buildQuadrupedAnchorMap(geometryAnalysis) {
   const headY = headLandmark?.y ?? min.y + height * 0.76
   const shoulderSpread = width * 0.26
   const hipSpread = width * 0.21
+  const frontForwardHint = pickRegionPoint(torsoExtents, 'front', null)?.forward ?? frontForward
+  const hindForwardHint = pickRegionPoint(legsExtents, 'back', null)?.forward ?? hindForward
+  const leftFrontLateral = pickRegionPoint(torsoExtents, 'left', null)?.lateral ?? lateralCenter - shoulderSpread
+  const rightFrontLateral = pickRegionPoint(torsoExtents, 'right', null)?.lateral ?? lateralCenter + shoulderSpread
+  const leftHindLateral = pickRegionPoint(feetExtents, 'left', null)?.lateral ?? lateralCenter - hipSpread
+  const rightHindLateral = pickRegionPoint(feetExtents, 'right', null)?.lateral ?? lateralCenter + hipSpread
+  const headFrontHint = pickRegionPoint(headExtents, 'front', null)?.forward ?? headForward
+  const tailBackHint = pickRegionPoint(feetExtents, 'back', null)?.forward ?? tailForward
 
   return {
     root: makeHorizontalPoint(center, axes, lateralCenter, footY, projectedCenter.forward),
-    pelvis: makeHorizontalPoint(center, axes, coreLandmark?.x ?? lateralCenter, pelvisY, hindForward + length * 0.12),
-    spineLower: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, bodyY, projectedCenter.forward - length * 0.05),
-    spineUpper: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, bodyY + height * 0.03, projectedCenter.forward + length * 0.12),
-    neck: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, bodyY + height * 0.08, projectedCenter.forward + length * 0.28),
-    head: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY, headForward),
-    jaw: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY - height * 0.03, headForward + length * 0.05),
-    frontLeftShoulder: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, bodyY, frontForward),
-    frontLeftUpperLeg: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, min.y + height * 0.45, frontForward),
-    frontLeftLowerLeg: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, min.y + height * 0.2, frontForward + length * 0.02),
-    frontLeftFoot: makeHorizontalPoint(center, axes, lateralCenter - shoulderSpread, footY, frontForward + length * 0.06),
-    frontRightShoulder: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, bodyY, frontForward),
-    frontRightUpperLeg: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, min.y + height * 0.45, frontForward),
-    frontRightLowerLeg: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, min.y + height * 0.2, frontForward + length * 0.02),
-    frontRightFoot: makeHorizontalPoint(center, axes, lateralCenter + shoulderSpread, footY, frontForward + length * 0.06),
-    hindLeftHip: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, pelvisY, hindForward),
-    hindLeftUpperLeg: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, min.y + height * 0.42, hindForward),
-    hindLeftLowerLeg: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, min.y + height * 0.19, hindForward - length * 0.02),
-    hindLeftFoot: makeHorizontalPoint(center, axes, lateralCenter - hipSpread, footY, hindForward - length * 0.03),
-    hindRightHip: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, pelvisY, hindForward),
-    hindRightUpperLeg: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, min.y + height * 0.42, hindForward),
-    hindRightLowerLeg: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, min.y + height * 0.19, hindForward - length * 0.02),
-    hindRightFoot: makeHorizontalPoint(center, axes, lateralCenter + hipSpread, footY, hindForward - length * 0.03),
-    tailBase: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.02, hindForward - length * 0.12),
-    tailTip: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.1, tailForward),
+    pelvis: makeHorizontalPoint(center, axes, coreLandmark?.x ?? lateralCenter, pelvisY, hindForwardHint + length * 0.1),
+    spineLower: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, bodyY, (hindForwardHint + frontForwardHint) * 0.5 - length * 0.04),
+    spineUpper: makeHorizontalPoint(center, axes, torsoLandmark?.x ?? lateralCenter, bodyY + height * 0.03, frontForwardHint),
+    neck: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, bodyY + height * 0.08, frontForwardHint + length * 0.13),
+    head: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY, headFrontHint),
+    jaw: makeHorizontalPoint(center, axes, headLandmark?.x ?? lateralCenter, headY - height * 0.03, headFrontHint + length * 0.04),
+    frontLeftShoulder: makeHorizontalPoint(center, axes, leftFrontLateral, bodyY, frontForwardHint),
+    frontLeftUpperLeg: makeHorizontalPoint(center, axes, leftFrontLateral, min.y + height * 0.45, frontForwardHint),
+    frontLeftLowerLeg: makeHorizontalPoint(center, axes, leftFrontLateral, min.y + height * 0.2, frontForwardHint + length * 0.02),
+    frontLeftFoot: makeHorizontalPoint(center, axes, feetExtents?.left?.lateral ?? leftFrontLateral, footY, feetExtents?.front?.forward ?? frontForwardHint + length * 0.06),
+    frontRightShoulder: makeHorizontalPoint(center, axes, rightFrontLateral, bodyY, frontForwardHint),
+    frontRightUpperLeg: makeHorizontalPoint(center, axes, rightFrontLateral, min.y + height * 0.45, frontForwardHint),
+    frontRightLowerLeg: makeHorizontalPoint(center, axes, rightFrontLateral, min.y + height * 0.2, frontForwardHint + length * 0.02),
+    frontRightFoot: makeHorizontalPoint(center, axes, feetExtents?.right?.lateral ?? rightFrontLateral, footY, feetExtents?.front?.forward ?? frontForwardHint + length * 0.06),
+    hindLeftHip: makeHorizontalPoint(center, axes, leftHindLateral, pelvisY, hindForwardHint),
+    hindLeftUpperLeg: makeHorizontalPoint(center, axes, leftHindLateral, min.y + height * 0.42, hindForwardHint),
+    hindLeftLowerLeg: makeHorizontalPoint(center, axes, leftHindLateral, min.y + height * 0.19, hindForwardHint - length * 0.02),
+    hindLeftFoot: makeHorizontalPoint(center, axes, feetExtents?.left?.lateral ?? leftHindLateral, footY, feetExtents?.back?.forward ?? hindForwardHint - length * 0.03),
+    hindRightHip: makeHorizontalPoint(center, axes, rightHindLateral, pelvisY, hindForwardHint),
+    hindRightUpperLeg: makeHorizontalPoint(center, axes, rightHindLateral, min.y + height * 0.42, hindForwardHint),
+    hindRightLowerLeg: makeHorizontalPoint(center, axes, rightHindLateral, min.y + height * 0.19, hindForwardHint - length * 0.02),
+    hindRightFoot: makeHorizontalPoint(center, axes, feetExtents?.right?.lateral ?? rightHindLateral, footY, feetExtents?.back?.forward ?? hindForwardHint - length * 0.03),
+    tailBase: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.02, hindForwardHint - length * 0.12),
+    tailTip: makeHorizontalPoint(center, axes, lateralCenter, pelvisY + height * 0.1, tailBackHint),
   }
 }
 
