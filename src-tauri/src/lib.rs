@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
+const AI_KEYCHAIN_SERVICE: &str = "animate-glb-app";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GlbSummary {
@@ -231,6 +233,23 @@ struct SaveAnimationClipInput {
   recipe: AnimationRecipe,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiConfig {
+  provider: String,
+  model: String,
+  api_key: String,
+  base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAiConfig {
+  provider: String,
+  model: String,
+  base_url: String,
+}
+
 fn saved_clips_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
   let app_data_dir = app_handle
     .path()
@@ -241,6 +260,157 @@ fn saved_clips_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, Strin
     .map_err(|error| format!("Unable to create the app data directory: {error}"))?;
 
   Ok(app_data_dir.join("saved-animation-clips.json"))
+}
+
+fn ai_config_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let app_data_dir = app_handle
+    .path()
+    .app_data_dir()
+    .map_err(|error| format!("Unable to locate the app data directory: {error}"))?;
+
+  fs::create_dir_all(&app_data_dir)
+    .map_err(|error| format!("Unable to create the app data directory: {error}"))?;
+
+  Ok(app_data_dir.join("ai-config.json"))
+}
+
+fn normalize_ai_provider(provider: &str) -> String {
+  match provider.trim().to_ascii_lowercase().as_str() {
+    "openai" => "openai".to_string(),
+    "openai-compatible" | "openai_compatible" | "compatible" | "openrouter" => {
+      "openai-compatible".to_string()
+    }
+    "anthropic" | "claude" => "anthropic".to_string(),
+    _ => "openai".to_string(),
+  }
+}
+
+fn ai_keychain_account(provider: &str) -> String {
+  format!("provider-{}", normalize_ai_provider(provider))
+}
+
+fn load_ai_api_key_from_keychain(provider: &str) -> Result<String, String> {
+  let entry = keyring::Entry::new(AI_KEYCHAIN_SERVICE, &ai_keychain_account(provider))
+    .map_err(|error| format!("Unable to access the system keychain entry: {error}"))?;
+
+  match entry.get_password() {
+    Ok(value) => Ok(value),
+    Err(keyring::Error::NoEntry) => Ok(String::new()),
+    Err(error) => Err(format!("Unable to read the API key from the system keychain: {error}")),
+  }
+}
+
+fn store_ai_api_key_in_keychain(provider: &str, api_key: &str) -> Result<(), String> {
+  let entry = keyring::Entry::new(AI_KEYCHAIN_SERVICE, &ai_keychain_account(provider))
+    .map_err(|error| format!("Unable to access the system keychain entry: {error}"))?;
+
+  if api_key.trim().is_empty() {
+    match entry.delete_credential() {
+      Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+      Err(error) => Err(format!("Unable to remove the API key from the system keychain: {error}")),
+    }
+  } else {
+    entry
+      .set_password(api_key.trim())
+      .map_err(|error| format!("Unable to save the API key to the system keychain: {error}"))
+  }
+}
+
+fn default_ai_model(provider: &str) -> String {
+  match normalize_ai_provider(provider).as_str() {
+    "anthropic" => env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string()),
+    _ => env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string()),
+  }
+}
+
+fn default_ai_base_url(provider: &str) -> String {
+  match normalize_ai_provider(provider).as_str() {
+    "anthropic" => "https://api.anthropic.com/v1/messages".to_string(),
+    _ => "https://api.openai.com/v1".to_string(),
+  }
+}
+
+fn default_ai_api_key(provider: &str) -> String {
+  load_ai_api_key_from_keychain(provider).unwrap_or_else(|_| match normalize_ai_provider(provider).as_str() {
+    "anthropic" => env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+    _ => env::var("OPENAI_API_KEY").unwrap_or_default(),
+  })
+}
+
+fn with_ai_config_defaults(config: AiConfig) -> AiConfig {
+  let provider = normalize_ai_provider(&config.provider);
+  let model = if config.model.trim().is_empty() {
+    default_ai_model(&provider)
+  } else {
+    config.model.trim().to_string()
+  };
+  let api_key = if config.api_key.trim().is_empty() {
+    default_ai_api_key(&provider)
+  } else {
+    config.api_key.trim().to_string()
+  };
+  let base_url = if config.base_url.trim().is_empty() {
+    default_ai_base_url(&provider)
+  } else {
+    config.base_url.trim().trim_end_matches('/').to_string()
+  };
+
+  AiConfig {
+    provider,
+    model,
+    api_key,
+    base_url,
+  }
+}
+
+fn default_ai_config() -> AiConfig {
+  with_ai_config_defaults(AiConfig {
+    provider: "openai".to_string(),
+    model: String::new(),
+    api_key: String::new(),
+    base_url: String::new(),
+  })
+}
+
+fn read_ai_config_from_disk(app_handle: &tauri::AppHandle) -> Result<AiConfig, String> {
+  let file_path = ai_config_file_path(app_handle)?;
+
+  if !file_path.exists() {
+    return Ok(default_ai_config());
+  }
+
+  let content = fs::read_to_string(&file_path)
+    .map_err(|error| format!("Unable to read the AI config from disk: {error}"))?;
+
+  if content.trim().is_empty() {
+    return Ok(default_ai_config());
+  }
+
+  let stored_config = serde_json::from_str::<StoredAiConfig>(&content)
+    .map_err(|error| format!("Unable to parse the AI config file: {error}"))?;
+
+  let provider = stored_config.provider;
+  let api_key = default_ai_api_key(&provider);
+
+  Ok(with_ai_config_defaults(AiConfig {
+    provider,
+    model: stored_config.model,
+    api_key,
+    base_url: stored_config.base_url,
+  }))
+}
+
+fn write_ai_config_to_disk(app_handle: &tauri::AppHandle, config: &AiConfig) -> Result<(), String> {
+  let file_path = ai_config_file_path(app_handle)?;
+  let content = serde_json::to_string_pretty(&StoredAiConfig {
+    provider: normalize_ai_provider(&config.provider),
+    model: config.model.trim().to_string(),
+    base_url: config.base_url.trim().trim_end_matches('/').to_string(),
+  })
+    .map_err(|error| format!("Unable to serialize the AI config file: {error}"))?;
+
+  fs::write(&file_path, content)
+    .map_err(|error| format!("Unable to write the AI config file: {error}"))
 }
 
 fn read_saved_animation_clips(app_handle: &tauri::AppHandle) -> Result<Vec<SavedAnimationClip>, String> {
@@ -1579,193 +1749,223 @@ fn sanitize_recipe(mut recipe: AnimationRecipe, summary: &GlbSummary) -> Animati
   recipe
 }
 
-async fn openai_recipe(prompt: &str, summary: &GlbSummary) -> Result<Option<AnimationRecipe>, String> {
-  let api_key = match env::var("OPENAI_API_KEY") {
-    Ok(value) if !value.trim().is_empty() => value,
-    _ => return Ok(None),
-  };
+fn openai_compatible_chat_endpoint(base_url: &str) -> String {
+  let normalized = base_url.trim().trim_end_matches('/');
+  if normalized.ends_with("/chat/completions") {
+    normalized.to_string()
+  } else {
+    format!("{normalized}/chat/completions")
+  }
+}
 
-  let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
+fn anthropic_messages_endpoint(base_url: &str) -> String {
+  let normalized = base_url.trim().trim_end_matches('/');
+  if normalized.ends_with("/messages") {
+    normalized.to_string()
+  } else {
+    format!("{normalized}/messages")
+  }
+}
+
+async fn request_openai_compatible_json(
+  config: &AiConfig,
+  system_prompt: &str,
+  user_prompt: &str,
+) -> Result<Option<String>, String> {
+  if config.api_key.trim().is_empty() {
+    return Ok(None);
+  }
+
   let client = reqwest::Client::new();
   let request_body = json!({
-    "model": model,
+    "model": config.model,
     "response_format": { "type": "json_object" },
     "messages": [
-      {
-        "role": "system",
-        "content": "You generate concise loop-friendly animation recipes for 3D models. Return JSON only. Use only these bindings: .position[x], .position[y], .position[z], .rotation[x], .rotation[y], .rotation[z], .scale[x], .scale[y], .scale[z]. Each track may include an optional targetName using an exact node or bone name from the provided candidate list. Omit targetName to animate the root. Times and values arrays must be equal length. Prefer head, neck, chest, spine, shoulder, arm, forearm, hand, hips, pelvis, or jaw targets when the prompt implies local body motion."
-      },
-      {
-        "role": "user",
-        "content": format!(
-          "Prompt: {prompt}\n\nModel summary: {}\n\nCandidate target node names: {}\n\nReturn an object with keys name, source, rationale, durationSeconds, looping, tracks. Each track must include binding, times, values, interpolation, and may include targetName. Keep duration under 12 seconds and use the exact targetName strings provided above when choosing local body motion.",
-          serde_json::to_string(summary).map_err(|error| error.to_string())?
-          , serde_json::to_string(&summary.target_node_names).map_err(|error| error.to_string())?
-        )
-      }
+      { "role": "system", "content": system_prompt },
+      { "role": "user", "content": user_prompt }
     ]
   });
 
   let response = client
-    .post("https://api.openai.com/v1/chat/completions")
-    .bearer_auth(api_key)
+    .post(openai_compatible_chat_endpoint(&config.base_url))
+    .bearer_auth(&config.api_key)
     .json(&request_body)
     .send()
     .await
     .map_err(|error| error.to_string())?;
 
   if !response.status().is_success() {
-    return Err(format!("OpenAI request failed with status {}", response.status()));
+    return Err(format!("AI request failed with status {}", response.status()));
   }
 
   let payload = response
     .json::<serde_json::Value>()
     .await
     .map_err(|error| error.to_string())?;
+
   let content = payload
     .get("choices")
     .and_then(|choices| choices.get(0))
     .and_then(|choice| choice.get("message"))
     .and_then(|message| message.get("content"))
     .and_then(|content| content.as_str())
-    .ok_or_else(|| "OpenAI response did not contain JSON content.".to_string())?;
+    .ok_or_else(|| "AI response did not contain JSON content.".to_string())?;
 
-  let mut recipe = serde_json::from_str::<AnimationRecipe>(content)
-    .map_err(|error| format!("OpenAI returned invalid JSON for an animation recipe: {error}"))?;
-  recipe.source = "openai".to_string();
+  Ok(Some(content.to_string()))
+}
+
+async fn request_anthropic_json(
+  config: &AiConfig,
+  system_prompt: &str,
+  user_prompt: &str,
+) -> Result<Option<String>, String> {
+  if config.api_key.trim().is_empty() {
+    return Ok(None);
+  }
+
+  let client = reqwest::Client::new();
+  let request_body = json!({
+    "model": config.model,
+    "max_tokens": 1800,
+    "system": system_prompt,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": user_prompt
+          }
+        ]
+      }
+    ]
+  });
+
+  let response = client
+    .post(anthropic_messages_endpoint(&config.base_url))
+    .header("x-api-key", &config.api_key)
+    .header("anthropic-version", "2023-06-01")
+    .json(&request_body)
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+  if !response.status().is_success() {
+    return Err(format!("Claude request failed with status {}", response.status()));
+  }
+
+  let payload = response
+    .json::<serde_json::Value>()
+    .await
+    .map_err(|error| error.to_string())?;
+
+  let content = payload
+    .get("content")
+    .and_then(|content| content.as_array())
+    .and_then(|content| content.first())
+    .and_then(|entry| entry.get("text"))
+    .and_then(|text| text.as_str())
+    .ok_or_else(|| "Claude response did not contain JSON content.".to_string())?;
+
+  Ok(Some(content.to_string()))
+}
+
+async fn request_ai_json(
+  config: &AiConfig,
+  system_prompt: &str,
+  user_prompt: &str,
+) -> Result<Option<String>, String> {
+  match normalize_ai_provider(&config.provider).as_str() {
+    "anthropic" => request_anthropic_json(config, system_prompt, user_prompt).await,
+    _ => request_openai_compatible_json(config, system_prompt, user_prompt).await,
+  }
+}
+
+async fn ai_recipe(
+  config: &AiConfig,
+  prompt: &str,
+  summary: &GlbSummary,
+) -> Result<Option<AnimationRecipe>, String> {
+  let content = match request_ai_json(
+    config,
+    "You generate concise loop-friendly animation recipes for 3D models. Return JSON only. Use only these bindings: .position[x], .position[y], .position[z], .rotation[x], .rotation[y], .rotation[z], .scale[x], .scale[y], .scale[z]. Each track may include an optional targetName using an exact node or bone name from the provided candidate list. Omit targetName to animate the root. Times and values arrays must be equal length. Prefer head, neck, chest, spine, shoulder, arm, forearm, hand, hips, pelvis, or jaw targets when the prompt implies local body motion.",
+    &format!(
+      "Prompt: {prompt}\n\nModel summary: {}\n\nCandidate target node names: {}\n\nReturn an object with keys name, source, rationale, durationSeconds, looping, tracks. Each track must include binding, times, values, interpolation, and may include targetName. Keep duration under 12 seconds and use the exact targetName strings provided above when choosing local body motion.",
+      serde_json::to_string(summary).map_err(|error| error.to_string())?,
+      serde_json::to_string(&summary.target_node_names).map_err(|error| error.to_string())?
+    ),
+  )
+  .await? {
+    Some(content) => content,
+    None => return Ok(None),
+  };
+
+  let mut recipe = serde_json::from_str::<AnimationRecipe>(&content)
+    .map_err(|error| format!("AI provider returned invalid JSON for an animation recipe: {error}"))?;
+  recipe.source = normalize_ai_provider(&config.provider);
 
   let sanitized = sanitize_recipe(recipe, summary);
 
   if sanitized.tracks.is_empty() {
     let mut fallback = fallback_recipe(prompt, summary);
-    fallback.source = "openai-fallback".to_string();
-    fallback.rationale = "OpenAI returned a recipe, but its track bindings could not be mapped into the current viewer. Applied a local playable fallback instead.".to_string();
+    fallback.source = format!("{}-fallback", normalize_ai_provider(&config.provider));
+    fallback.rationale = "The configured AI provider returned a recipe, but its track bindings could not be mapped into the current viewer. Applied a local playable fallback instead.".to_string();
     return Ok(Some(fallback));
   }
 
   Ok(Some(sanitized))
 }
 
-async fn openai_rig_proposal(
+async fn ai_rig_proposal(
+  config: &AiConfig,
   summary: &GlbSummary,
   geometry_analysis: Option<&GeometryAnalysis>,
 ) -> Result<Option<RigProposal>, String> {
-  let api_key = match env::var("OPENAI_API_KEY") {
-    Ok(value) if !value.trim().is_empty() => value,
-    _ => return Ok(None),
+  let content = match request_ai_json(
+    config,
+    "You analyze 3D assets for rigging readiness. Return JSON only. You never claim that rigging has been applied. Instead, return a cautious proposal with these keys: source, rigFamily, canonicalSlots, riggingNeeded, confidence, readiness, rationale, proposedRigProfile, unresolvedSlots, recommendedActions, warnings. Respect the detected rig family in the summary. Never convert quadruped, arachnid, generic-creature, prop, or avian assets into humanoids unless the evidence is overwhelming. proposedRigProfile may remain sparse for non-humanoid families.",
+    &format!(
+      "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nGeometry analysis: {}\n\nReturn a cautious rigging proposal that preserves the detected family shape. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps. The canonicalSlots field should match the target family rather than defaulting to humanoid slots. Treat geometry clues as authoritative when naming is weak or misleading.",
+      serde_json::to_string(summary).map_err(|error| error.to_string())?,
+      serde_json::to_string(&summary.rig_diagnostics).map_err(|error| error.to_string())?,
+      serde_json::to_string(&geometry_analysis).map_err(|error| error.to_string())?
+    ),
+  )
+  .await? {
+    Some(content) => content,
+    None => return Ok(None),
   };
 
-  let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
-  let client = reqwest::Client::new();
-  let request_body = json!({
-    "model": model,
-    "response_format": { "type": "json_object" },
-    "messages": [
-      {
-        "role": "system",
-        "content": "You analyze 3D assets for rigging readiness. Return JSON only. You never claim that rigging has been applied. Instead, return a cautious proposal with these keys: source, rigFamily, canonicalSlots, riggingNeeded, confidence, readiness, rationale, proposedRigProfile, unresolvedSlots, recommendedActions, warnings. Respect the detected rig family in the summary. Never convert quadruped, arachnid, generic-creature, or prop assets into humanoids unless the evidence is overwhelming. proposedRigProfile may remain sparse for non-humanoid families."
-      },
-      {
-        "role": "user",
-        "content": format!(
-          "Model summary for rigging analysis: {}\n\nCurrent rig diagnostics: {}\n\nGeometry analysis: {}\n\nReturn a cautious rigging proposal that preserves the detected family shape. If the asset is already rigged enough for animation targeting, keep riggingNeeded false and explain why. If the asset needs rigging or remapping, keep the recommendation non-destructive and mention review steps. The canonicalSlots field should match the target family rather than defaulting to humanoid slots. Treat geometry clues as authoritative when naming is weak or misleading.",
-          serde_json::to_string(summary).map_err(|error| error.to_string())?,
-          serde_json::to_string(&summary.rig_diagnostics).map_err(|error| error.to_string())?,
-          serde_json::to_string(&geometry_analysis).map_err(|error| error.to_string())?
-        )
-      }
-    ]
-  });
-
-  let response = client
-    .post("https://api.openai.com/v1/chat/completions")
-    .bearer_auth(api_key)
-    .json(&request_body)
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-
-  if !response.status().is_success() {
-    return Err(format!("OpenAI rig proposal request failed with status {}", response.status()));
-  }
-
-  let payload = response
-    .json::<serde_json::Value>()
-    .await
-    .map_err(|error| error.to_string())?;
-  let content = payload
-    .get("choices")
-    .and_then(|choices| choices.get(0))
-    .and_then(|choice| choice.get("message"))
-    .and_then(|message| message.get("content"))
-    .and_then(|content| content.as_str())
-    .ok_or_else(|| "OpenAI response did not contain JSON content for rig proposal.".to_string())?;
-
-  let mut proposal = serde_json::from_str::<RigProposal>(content)
-    .map_err(|error| format!("OpenAI returned invalid JSON for a rig proposal: {error}"))?;
-  proposal.source = "openai".to_string();
+  let mut proposal = serde_json::from_str::<RigProposal>(&content)
+    .map_err(|error| format!("AI provider returned invalid JSON for a rig proposal: {error}"))?;
+  proposal.source = normalize_ai_provider(&config.provider);
   Ok(Some(sanitize_rig_proposal(proposal, summary, geometry_analysis)))
 }
 
-async fn openai_rig_upgrade_plan(
+async fn ai_rig_upgrade_plan(
+  config: &AiConfig,
   summary: &GlbSummary,
   proposal: &RigProposal,
   geometry_analysis: Option<&GeometryAnalysis>,
 ) -> Result<Option<RigUpgradePlan>, String> {
-  let api_key = match env::var("OPENAI_API_KEY") {
-    Ok(value) if !value.trim().is_empty() => value,
-    _ => return Ok(None),
+  let content = match request_ai_json(
+    config,
+    "You plan cautious rig upgrades for 3D assets. Return JSON only. Never claim that weights or rigging have already been applied. Return these keys: source, rigFamily, canonicalSlots, readiness, confidence, rationale, targetRigType, applyStrategy, requiresWeightPainting, canExportAfterUpgrade, preservedJointSlots, newJointSlots, chainPlans, recommendedSteps, warnings. Each chainPlans item must include name, slots, existingNodes, action. Respect the requested rig family and never humanoidize quadruped, arachnid, prop, generic-creature, or avian assets.",
+    &format!(
+      "Model summary: {}\n\nRig proposal: {}\n\nGeometry analysis: {}\n\nBuild a non-destructive rig upgrade plan that preserves the asset's detected family. Prefer preserving existing rig structure when it exists. If the asset is unrigged, plan for canonical family-appropriate skeleton creation plus later weight generation. targetRigType should be family-specific, for example canonical-quadruped, canonical-avian, or canonical-arachnid when appropriate. Use the geometry analysis to disambiguate family choice, body orientation, and limb layout when naming is sparse.",
+      serde_json::to_string(summary).map_err(|error| error.to_string())?,
+      serde_json::to_string(proposal).map_err(|error| error.to_string())?,
+      serde_json::to_string(&geometry_analysis).map_err(|error| error.to_string())?
+    ),
+  )
+  .await? {
+    Some(content) => content,
+    None => return Ok(None),
   };
 
-  let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
-  let client = reqwest::Client::new();
-  let request_body = json!({
-    "model": model,
-    "response_format": { "type": "json_object" },
-    "messages": [
-      {
-        "role": "system",
-        "content": "You plan cautious rig upgrades for 3D assets. Return JSON only. Never claim that weights or rigging have already been applied. Return these keys: source, rigFamily, canonicalSlots, readiness, confidence, rationale, targetRigType, applyStrategy, requiresWeightPainting, canExportAfterUpgrade, preservedJointSlots, newJointSlots, chainPlans, recommendedSteps, warnings. Each chainPlans item must include name, slots, existingNodes, action. Respect the requested rig family and never humanoidize quadruped, arachnid, prop, or generic-creature assets."
-      },
-      {
-        "role": "user",
-        "content": format!(
-          "Model summary: {}\n\nRig proposal: {}\n\nGeometry analysis: {}\n\nBuild a non-destructive rig upgrade plan that preserves the asset's detected family. Prefer preserving existing rig structure when it exists. If the asset is unrigged, plan for canonical family-appropriate skeleton creation plus later weight generation. targetRigType should be family-specific, for example canonical-quadruped or canonical-arachnid when appropriate. Use the geometry analysis to disambiguate family choice, body orientation, and limb layout when naming is sparse.",
-          serde_json::to_string(summary).map_err(|error| error.to_string())?,
-          serde_json::to_string(proposal).map_err(|error| error.to_string())?,
-          serde_json::to_string(&geometry_analysis).map_err(|error| error.to_string())?
-        )
-      }
-    ]
-  });
-
-  let response = client
-    .post("https://api.openai.com/v1/chat/completions")
-    .bearer_auth(api_key)
-    .json(&request_body)
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-
-  if !response.status().is_success() {
-    return Err(format!("OpenAI rig upgrade request failed with status {}", response.status()));
-  }
-
-  let payload = response
-    .json::<serde_json::Value>()
-    .await
-    .map_err(|error| error.to_string())?;
-  let content = payload
-    .get("choices")
-    .and_then(|choices| choices.get(0))
-    .and_then(|choice| choice.get("message"))
-    .and_then(|message| message.get("content"))
-    .and_then(|content| content.as_str())
-    .ok_or_else(|| "OpenAI response did not contain JSON content for a rig upgrade plan.".to_string())?;
-
-  let mut plan = serde_json::from_str::<RigUpgradePlan>(content)
-    .map_err(|error| format!("OpenAI returned invalid JSON for a rig upgrade plan: {error}"))?;
-  plan.source = "openai".to_string();
+  let mut plan = serde_json::from_str::<RigUpgradePlan>(&content)
+    .map_err(|error| format!("AI provider returned invalid JSON for a rig upgrade plan: {error}"))?;
+  plan.source = normalize_ai_provider(&config.provider);
   Ok(Some(sanitize_rig_upgrade_plan(plan, summary, proposal, geometry_analysis)))
 }
 
@@ -1881,40 +2081,68 @@ async fn read_glb_binary(file_path: String) -> Result<GlbBinaryPayload, String> 
 }
 
 #[tauri::command]
-async fn generate_animation_recipe(input: GenerateAnimationInput) -> Result<AnimationRecipe, String> {
+fn read_ai_config(app_handle: tauri::AppHandle) -> Result<AiConfig, String> {
+  read_ai_config_from_disk(&app_handle)
+}
+
+#[tauri::command]
+fn save_ai_config(app_handle: tauri::AppHandle, input: AiConfig) -> Result<AiConfig, String> {
+  let config = with_ai_config_defaults(input);
+  store_ai_api_key_in_keychain(&config.provider, &config.api_key)?;
+  write_ai_config_to_disk(&app_handle, &config)?;
+  Ok(config)
+}
+
+#[tauri::command]
+async fn generate_animation_recipe(
+  app_handle: tauri::AppHandle,
+  input: GenerateAnimationInput,
+) -> Result<AnimationRecipe, String> {
   if input.prompt.trim().is_empty() {
     return Err("Please enter a prompt before generating an animation.".to_string());
   }
 
-  match openai_recipe(&input.prompt, &input.summary).await {
+  let config = read_ai_config_from_disk(&app_handle)?;
+
+  match ai_recipe(&config, &input.prompt, &input.summary).await {
     Ok(Some(recipe)) => Ok(recipe),
     Ok(None) => Ok(fallback_recipe(&input.prompt, &input.summary)),
     Err(error) => {
-      log::warn!("OpenAI animation generation failed, using fallback recipe: {error}");
+      log::warn!("Configured AI animation generation failed, using fallback recipe: {error}");
       Ok(fallback_recipe(&input.prompt, &input.summary))
     }
   }
 }
 
 #[tauri::command]
-async fn generate_rig_proposal(input: GenerateRigProposalInput) -> Result<RigProposal, String> {
-  match openai_rig_proposal(&input.summary, input.geometry_analysis.as_ref()).await {
+async fn generate_rig_proposal(
+  app_handle: tauri::AppHandle,
+  input: GenerateRigProposalInput,
+) -> Result<RigProposal, String> {
+  let config = read_ai_config_from_disk(&app_handle)?;
+
+  match ai_rig_proposal(&config, &input.summary, input.geometry_analysis.as_ref()).await {
     Ok(Some(proposal)) => Ok(proposal),
     Ok(None) => Ok(fallback_rig_proposal(&input.summary, input.geometry_analysis.as_ref())),
     Err(error) => {
-      log::warn!("OpenAI rig proposal generation failed, using fallback proposal: {error}");
+      log::warn!("Configured AI rig proposal generation failed, using fallback proposal: {error}");
       Ok(fallback_rig_proposal(&input.summary, input.geometry_analysis.as_ref()))
     }
   }
 }
 
 #[tauri::command]
-async fn generate_rig_upgrade_plan(input: GenerateRigUpgradeInput) -> Result<RigUpgradePlan, String> {
-  match openai_rig_upgrade_plan(&input.summary, &input.proposal, input.geometry_analysis.as_ref()).await {
+async fn generate_rig_upgrade_plan(
+  app_handle: tauri::AppHandle,
+  input: GenerateRigUpgradeInput,
+) -> Result<RigUpgradePlan, String> {
+  let config = read_ai_config_from_disk(&app_handle)?;
+
+  match ai_rig_upgrade_plan(&config, &input.summary, &input.proposal, input.geometry_analysis.as_ref()).await {
     Ok(Some(plan)) => Ok(plan),
     Ok(None) => Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal, input.geometry_analysis.as_ref())),
     Err(error) => {
-      log::warn!("OpenAI rig upgrade generation failed, using fallback plan: {error}");
+      log::warn!("Configured AI rig upgrade generation failed, using fallback plan: {error}");
       Ok(fallback_rig_upgrade_plan(&input.summary, &input.proposal, input.geometry_analysis.as_ref()))
     }
   }
@@ -1963,6 +2191,10 @@ pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
+      if let Some(window) = app.get_webview_window("main") {
+        let _ = window.maximize();
+      }
+
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
@@ -1975,6 +2207,8 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       inspect_glb,
       read_glb_binary,
+      read_ai_config,
+      save_ai_config,
       generate_animation_recipe,
       generate_rig_proposal,
       generate_rig_upgrade_plan,

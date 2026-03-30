@@ -5,6 +5,42 @@
   padding: 32px;
 }
 
+.error-overlay {
+  position: sticky;
+  top: 14px;
+  z-index: 40;
+  pointer-events: none;
+}
+
+.error-overlay-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 117, 98, 0.55);
+  background: rgba(112, 23, 20, 0.92);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.35);
+  color: #ffd0ca;
+  pointer-events: auto;
+}
+
+.error-overlay-message {
+  margin-top: 6px;
+  color: #ffe2dd;
+}
+
+.error-overlay-dismiss {
+  appearance: none;
+  border: 0;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff1ee;
+  border-radius: 999px;
+  padding: 0.65rem 0.9rem;
+  cursor: pointer;
+}
+
 .hero-panel,
 .panel {
   border: 1px solid var(--panel-line);
@@ -392,10 +428,18 @@
   margin-top: 12px;
 }
 
+.rig-editor-grid-wide {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .rig-editor-grid label,
 .rig-editor-add label {
   display: grid;
   gap: 6px;
+}
+
+.rig-editor-field-wide {
+  grid-column: span 1;
 }
 
 .rig-editor-grid input,
@@ -600,15 +644,6 @@
   color: var(--soft-text);
 }
 
-.error-banner {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border-radius: 16px;
-  background: rgba(157, 55, 45, 0.22);
-  border: 1px solid rgba(255, 125, 109, 0.35);
-  color: #ffc4ba;
-}
-
 @media (max-width: 1100px) {
   .workspace-grid {
     grid-template-columns: 1fr;
@@ -638,6 +673,11 @@
 
   .viewer-stage {
     min-height: 380px;
+  }
+
+  .error-overlay-card {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .stats-grid {

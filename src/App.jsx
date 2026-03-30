@@ -7,6 +7,28 @@ import './App.css'
 const DEFAULT_PROMPT =
   'Create a confident idle animation with subtle breathing, a gentle torso sway, and a slow turn.'
 
+const AI_PROVIDER_DEFAULTS = {
+  openai: {
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-5.4',
+  },
+  'openai-compatible': {
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-5.4',
+  },
+  anthropic: {
+    baseUrl: 'https://api.anthropic.com/v1/messages',
+    model: 'claude-3-5-sonnet-latest',
+  },
+}
+
+const DEFAULT_AI_CONFIG = {
+  provider: 'openai',
+  model: AI_PROVIDER_DEFAULTS.openai.model,
+  apiKey: '',
+  baseUrl: AI_PROVIDER_DEFAULTS.openai.baseUrl,
+}
+
 function formatBytes(size) {
   if (!Number.isFinite(size) || size <= 0) {
     return '0 B'
@@ -24,8 +46,24 @@ function sourceLabel(source) {
     return 'OpenAI recipe'
   }
 
+  if (source === 'openai-compatible') {
+    return 'Compatible provider recipe'
+  }
+
+  if (source === 'anthropic') {
+    return 'Claude recipe'
+  }
+
   if (source === 'openai-fallback') {
     return 'OpenAI fallback recipe'
+  }
+
+  if (source === 'openai-compatible-fallback') {
+    return 'Compatible provider fallback recipe'
+  }
+
+  if (source === 'anthropic-fallback') {
+    return 'Claude fallback recipe'
   }
 
   if (source === 'browser') {
@@ -886,6 +924,7 @@ function App() {
   const viewportRef = useRef(null)
   const isTauriRuntime = typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__ !== 'undefined'
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
+  const [aiConfig, setAiConfig] = useState(DEFAULT_AI_CONFIG)
   const [summary, setSummary] = useState(null)
   const [viewerUrl, setViewerUrl] = useState('')
   const [viewerFilePath, setViewerFilePath] = useState('')
@@ -907,7 +946,9 @@ function App() {
   const [showAllTargetNodes, setShowAllTargetNodes] = useState(false)
   const [isPickingModel, setIsPickingModel] = useState(false)
   const [isGeneratingRecipe, setIsGeneratingRecipe] = useState(false)
+  const [isLoadingAiConfig, setIsLoadingAiConfig] = useState(false)
   const [isLoadingSavedClips, setIsLoadingSavedClips] = useState(false)
+  const [isSavingAiConfig, setIsSavingAiConfig] = useState(false)
   const [isSavingClip, setIsSavingClip] = useState(false)
   const [isExportingGlb, setIsExportingGlb] = useState(false)
   const [isGeneratingRigProposal, setIsGeneratingRigProposal] = useState(false)
@@ -927,6 +968,29 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    if (!isTauriRuntime) {
+      return
+    }
+
+    async function loadAiConfig() {
+      setIsLoadingAiConfig(true)
+
+      try {
+        const nextConfig = await invoke('read_ai_config')
+        setAiConfig(nextConfig)
+      } catch (error) {
+        setErrorMessage(
+          error instanceof Error ? error.message : 'Unable to load the AI provider config.',
+        )
+      } finally {
+        setIsLoadingAiConfig(false)
+      }
+    }
+
+    loadAiConfig()
+  }, [isTauriRuntime])
 
   useEffect(() => {
     if (!isTauriRuntime) {
@@ -965,6 +1029,48 @@ function App() {
   const editableRigPlan = buildEditableRigPlan(rigUpgradePlan, rigEditDraft)
   const rigEditorSlots = Object.keys(rigEditDraft?.anchorMap ?? {})
   const selectedRigPosition = selectedRigSlot ? rigEditDraft?.anchorMap?.[selectedRigSlot] ?? null : null
+
+  async function handleSaveAiConfig() {
+    if (!isTauriRuntime) {
+      return
+    }
+
+    setErrorMessage('')
+    setIsSavingAiConfig(true)
+
+    try {
+      const savedConfig = await invoke('save_ai_config', { input: aiConfig })
+      setAiConfig(savedConfig)
+      setViewerStatus(`Saved AI config for ${savedConfig.provider}.`)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Unable to save the AI provider config.',
+      )
+    } finally {
+      setIsSavingAiConfig(false)
+    }
+  }
+
+  function handleAiConfigFieldChange(fieldName, fieldValue) {
+    setAiConfig((currentConfig) => ({
+      ...currentConfig,
+      [fieldName]: fieldValue,
+    }))
+  }
+
+  function handleAiProviderChange(nextProvider) {
+    const providerDefaults = AI_PROVIDER_DEFAULTS[nextProvider] ?? AI_PROVIDER_DEFAULTS.openai
+    setAiConfig((currentConfig) => ({
+      ...currentConfig,
+      provider: nextProvider,
+      baseUrl: currentConfig.baseUrl === AI_PROVIDER_DEFAULTS[currentConfig.provider]?.baseUrl || !currentConfig.baseUrl
+        ? providerDefaults.baseUrl
+        : currentConfig.baseUrl,
+      model: currentConfig.model === AI_PROVIDER_DEFAULTS[currentConfig.provider]?.model || !currentConfig.model
+        ? providerDefaults.model
+        : currentConfig.model,
+    }))
+  }
 
   function applyBrowserFile(file) {
     if (!file) {
@@ -1716,6 +1822,25 @@ function App() {
 
   return (
     <main className="shell">
+      {errorMessage ? (
+        <div className="error-overlay" role="alert" aria-live="assertive">
+          <div className="error-overlay-card">
+            <div>
+              <p className="label">Error</p>
+              <p className="error-overlay-message">{errorMessage}</p>
+            </div>
+            <button
+              className="error-overlay-dismiss"
+              type="button"
+              onClick={() => setErrorMessage('')}
+              aria-label="Dismiss error"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <input
         ref={browserInputRef}
         type="file"
@@ -1787,6 +1912,87 @@ function App() {
         </div>
 
         <div className="control-column">
+          <section className="panel prompt-panel">
+            <div className="panel-header compact">
+              <div>
+                <p className="panel-kicker">AI</p>
+                <h2>Provider config</h2>
+              </div>
+              <span className="pill">{isTauriRuntime ? aiConfig.provider : 'Browser mode'}</span>
+            </div>
+
+            <div className="recipe-card">
+              <p className="recipe-rationale">
+                Choose the backend provider and persist it to disk so animation, rig proposal, and rig upgrade generation all use the same config.
+              </p>
+
+              <div className="rig-editor-add">
+                <label>
+                  <span className="label">Provider</span>
+                  <select
+                    value={aiConfig.provider}
+                    onChange={(event) => handleAiProviderChange(event.target.value)}
+                    disabled={!isTauriRuntime || isLoadingAiConfig || isSavingAiConfig}
+                  >
+                    <option value="openai">OpenAI</option>
+                    <option value="openai-compatible">OpenAI compatible</option>
+                    <option value="anthropic">Claude</option>
+                  </select>
+                </label>
+                <label>
+                  <span className="label">Model</span>
+                  <input
+                    type="text"
+                    value={aiConfig.model}
+                    onChange={(event) => handleAiConfigFieldChange('model', event.target.value)}
+                    disabled={!isTauriRuntime || isLoadingAiConfig || isSavingAiConfig}
+                    placeholder="gpt-5.4"
+                  />
+                </label>
+                <div />
+              </div>
+
+              <div className="rig-editor-grid rig-editor-grid-wide">
+                <label>
+                  <span className="label">Base URL</span>
+                  <input
+                    type="text"
+                    value={aiConfig.baseUrl}
+                    onChange={(event) => handleAiConfigFieldChange('baseUrl', event.target.value)}
+                    disabled={!isTauriRuntime || isLoadingAiConfig || isSavingAiConfig}
+                    placeholder="https://api.openai.com/v1"
+                  />
+                </label>
+                <label className="rig-editor-field-wide">
+                  <span className="label">API key</span>
+                  <input
+                    type="password"
+                    value={aiConfig.apiKey}
+                    onChange={(event) => handleAiConfigFieldChange('apiKey', event.target.value)}
+                    disabled={!isTauriRuntime || isLoadingAiConfig || isSavingAiConfig}
+                    placeholder={aiConfig.provider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
+                  />
+                </label>
+              </div>
+
+              <div className="clip-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleSaveAiConfig}
+                  disabled={!isTauriRuntime || isLoadingAiConfig || isSavingAiConfig}
+                >
+                  {isSavingAiConfig ? 'Saving config…' : 'Save AI config'}
+                </button>
+                <span className="clip-actions-note">
+                  {isTauriRuntime
+                    ? 'Provider, model, and base URL are saved in app config. The API key is stored in the OS keychain and used by all native AI generation commands.'
+                    : 'Provider config persistence is only available in the native Tauri app.'}
+                </span>
+              </div>
+            </div>
+          </section>
+
           <section className="panel metadata-panel">
             <div className="panel-header compact">
               <div>
@@ -2506,9 +2712,6 @@ function App() {
                 </button>
               </div>
             </form>
-
-            {errorMessage ? <p className="error-banner">{errorMessage}</p> : null}
-
             <div className="recipe-card">
               <div className="recipe-headline">
                 <div>
